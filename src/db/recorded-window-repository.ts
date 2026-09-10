@@ -5,7 +5,7 @@ import {
   type StoredWindowDocument,
   WK,
 } from "../window-compact.js";
-import { marketWindowsDir } from "./data-dir.js";
+import { marketWindowsDir, parseWindowStartFromFilename } from "./data-dir.js";
 import { deleteWindowFilesBefore, listWindowFiles, readJsonFile, writeJsonFile } from "./file-store.js";
 import fs from "fs/promises";
 import path from "path";
@@ -35,6 +35,17 @@ export async function getRecordedWindow(
 ): Promise<RecordedWindowDocument | null> {
   const doc = await readJsonFile<StoredWindowDocument>(windowFilePath(market, windowStart));
   return doc ? fromStoredRecordedWindow(doc) : null;
+}
+
+/** Finished window starts (JSON written at finalize). */
+export async function listRecordedWindowStarts(series: string): Promise<number[]> {
+  const files = await listWindowFiles(marketWindowsDir(series));
+  const starts: number[] = [];
+  for (const filename of files) {
+    const windowStart = parseWindowStartFromFilename(filename);
+    if (windowStart != null) starts.push(windowStart);
+  }
+  return starts.sort((a, b) => a - b);
 }
 
 export async function listRecordedWindows(

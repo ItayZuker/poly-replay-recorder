@@ -1324,17 +1324,18 @@ export class MarketRecorder {
 
       await this.flushTicks();
 
-      if (isFlatPriceWindow(record) || this.isActiveWindowUnusablePricePath()) {
-        await discardBadRecording(
-          this.market._id,
-          windowStart,
-          isFlatPriceWindow(record)
-            ? "flat asset price through the window"
-            : "unusable price path (gap or half-flat)",
-        );
+      if (this.clobBookCount === 0 && this.chainlinkCount === 0) {
+        await discardBadRecording(this.market._id, windowStart, "no book or chainlink ticks");
         this.finalizedWindowStarts.add(windowStart);
         this.onStateChange?.(this.market._id);
         return;
+      }
+
+      if (isFlatPriceWindow(record) || this.isActiveWindowUnusablePricePath()) {
+        logService.warn(
+          "recorder",
+          `Thin price path for ${this.market._id} @ ${new Date(windowStart * 1000).toLocaleTimeString()} (gap or flat) — keeping recording`,
+        );
       }
 
       const savedAt = record.savedAt ?? new Date().toISOString();

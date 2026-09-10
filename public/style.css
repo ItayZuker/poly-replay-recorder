@@ -62,12 +62,9 @@ body {
   white-space: nowrap;
 }
 
-.app-title-poly {
-  color: var(--down);
-}
-
+.app-title-poly,
 .app-title-recorder {
-  color: var(--up);
+  color: var(--accent);
 }
 
 .header-nav {
@@ -104,6 +101,18 @@ body {
   display: flex;
   align-items: center;
   flex-shrink: 0;
+}
+
+.recording-switch-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.recording-switch-caption {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
 }
 
 .recording-switch {
@@ -143,17 +152,21 @@ body {
 }
 
 .recording-switch.is-on {
-  color: var(--up);
-  border-color: color-mix(in srgb, var(--up) 50%, var(--border));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+}
+
+.recording-switch-wrap:has(.recording-switch.is-on) .recording-switch-caption {
+  color: var(--accent);
 }
 
 .recording-switch.is-on .recording-switch-knob {
-  background: color-mix(in srgb, var(--up) 40%, #1b3d24);
+  background: color-mix(in srgb, var(--accent) 40%, #1b2d44);
 }
 
 .recording-switch.is-on .recording-switch-knob::after {
   transform: translateX(14px);
-  background: var(--up);
+  background: var(--accent);
 }
 
 .recording-switch:disabled {
@@ -165,14 +178,13 @@ body {
   flex: 1 1 0;
   min-height: 0;
   width: 100%;
-  padding: 8px;
 }
 
 .week-grid {
   height: 100%;
   width: 100%;
   display: grid;
-  grid-template-columns: 44px repeat(7, minmax(0, 1fr));
+  grid-template-columns: 52px repeat(7, minmax(0, 1fr));
   grid-template-rows: 28px repeat(24, minmax(0, 1fr));
   border: 1px solid var(--border);
   background: var(--panel);
@@ -201,9 +213,9 @@ body {
 }
 
 .week-hour.is-now,
-.week-slot.is-now {
-  box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.85);
-  z-index: 1;
+.week-day.is-now {
+  background: color-mix(in srgb, var(--accent) 38%, var(--panel));
+  color: var(--text);
 }
 
 .week-slot {
@@ -212,29 +224,40 @@ body {
   min-height: 0;
   border-right: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
-  background: var(--down);
+  background: var(--bg);
   overflow: hidden;
-}
-
-.week-slot-bar {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 0;
-  background: var(--up);
   display: flex;
-  align-items: center;
-  justify-content: flex-start;
+  align-items: stretch;
+  gap: 2px;
+  padding: 3px;
 }
 
-.week-slot-count {
-  position: relative;
-  z-index: 1;
-  padding: 0 5px;
-  font-size: 11px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  color: #fff;
-  line-height: 1;
-  text-shadow: 0 0 2px rgba(0, 0, 0, 0.45);
-  pointer-events: none;
+.week-slot-win {
+  flex: 1 1 0;
+  min-width: 0;
+  border-radius: 2px;
+}
+
+.week-slot-win.is-missing {
+  background: var(--down);
+}
+
+.week-slot-win.is-recorded {
+  background: var(--up);
+}
+
+.week-slot-win.is-live {
+  background: var(--accent);
+  animation: chip-pulse 0.8s ease-in-out infinite;
+  z-index: 2;
+}
+
+@keyframes chip-pulse {
+  0%,
+  100% {
+    filter: brightness(0.45);
+  }
+  50% {
+    filter: brightness(1.35);
+  }
 }

@@ -9,15 +9,21 @@ const grid = document.getElementById("week-grid");
 let markets = [];
 let selectedSeries = "btc-5m";
 let switchBusy = false;
+let expectedPerHour = 12;
 
 function padHour(hour) {
-  return `${String(hour).padStart(2, "0")}`;
+  return `${String(hour).padStart(2, "0")}:00`;
 }
 
 function currentUtcDayHour() {
   const now = new Date();
   const day = DAYS[(now.getUTCDay() + 6) % 7];
   return { day, hour: now.getUTCHours() };
+}
+
+function currentChipIndex(expected) {
+  const winMin = expected === 4 ? 15 : 5;
+  return Math.floor(new Date().getUTCMinutes() / winMin);
 }
 
 function buildGrid() {
@@ -44,13 +50,7 @@ function buildGrid() {
       slot.className = "week-slot";
       slot.dataset.day = day;
       slot.dataset.hour = String(hour);
-      const bar = document.createElement("div");
-      bar.className = "week-slot-bar";
-      const count = document.createElement("span");
-      count.className = "week-slot-count";
-      count.textContent = "0";
-      slot.appendChild(bar);
-      slot.appendChild(count);
+      fillSlotWindows(slot, 12);
       grid.appendChild(slot);
     }
   }
@@ -60,33 +60,56 @@ function setSwitch(on) {
   switchBtn.classList.toggle("is-on", on);
   switchBtn.setAttribute("aria-pressed", on ? "true" : "false");
   switchLabel.textContent = on ? "On" : "Off";
+  grid.classList.toggle("is-recording", on);
+  paintNow();
 }
 
 function paintNow() {
   const now = currentUtcDayHour();
   grid.querySelectorAll(".is-now").forEach((el) => el.classList.remove("is-now"));
+  grid.querySelectorAll(".week-slot-win.is-live").forEach((el) => el.classList.remove("is-live"));
   grid.querySelector(`.week-hour[data-hour="${now.hour}"]`)?.classList.add("is-now");
-  grid
-    .querySelector(`.week-slot[data-day="${now.day}"][data-hour="${now.hour}"]`)
-    ?.classList.add("is-now");
+  grid.querySelector(`.week-day[data-day="${now.day}"]`)?.classList.add("is-now");
+  if (!grid.classList.contains("is-recording")) return;
+  const slot = grid.querySelector(`.week-slot[data-day="${now.day}"][data-hour="${now.hour}"]`);
+  if (!slot) return;
+  const chips = slot.querySelectorAll(".week-slot-win");
+  const chip = chips[currentChipIndex(chips.length || expectedPerHour)];
+  if (!chip) return;
+  chip.classList.add("is-live");
+  chip.classList.remove("is-missing", "is-recorded");
+}
+
+function fillSlotWindows(slot, expected) {
+  const chips = slot.querySelectorAll(".week-slot-win");
+  if (chips.length === expected) return;
+  slot.replaceChildren();
+  for (let i = 0; i < expected; i += 1) {
+    const chip = document.createElement("div");
+    chip.className = "week-slot-win is-missing";
+    slot.appendChild(chip);
+  }
 }
 
 function paintCoverage(payload) {
   const byKey = new Map(
     (payload.slots ?? []).map((s) => [`${s.day}:${s.hour}`, s]),
   );
+  expectedPerHour = Number(payload.expectedPerHour) || 12;
+  const expected = expectedPerHour;
   for (const day of DAYS) {
     for (let hour = 0; hour < 24; hour += 1) {
       const slot = grid.querySelector(`.week-slot[data-day="${day}"][data-hour="${hour}"]`);
       if (!slot) continue;
+      fillSlotWindows(slot, expected);
       const row = byKey.get(`${day}:${hour}`);
-      const recorded = Number(row?.recorded) || 0;
-      const expected = Number(row?.expected) || 12;
-      const pct = expected > 0 ? Math.min(100, (recorded / expected) * 100) : 0;
-      const bar = slot.querySelector(".week-slot-bar");
-      const count = slot.querySelector(".week-slot-count");
-      bar.style.width = `${pct}%`;
-      count.textContent = String(recorded);
+      const flags = Array.isArray(row?.windows) ? row.windows : [];
+      slot.querySelectorAll(".week-slot-win").forEach((chip, i) => {
+        const on = flags[i] === true;
+        chip.classList.toggle("is-recorded", on);
+        chip.classList.toggle("is-missing", !on);
+        chip.classList.remove("is-live");
+      });
     }
   }
   if (typeof payload.recordingEnabled === "boolean") {
@@ -174,5 +197,5 @@ void (async () => {
   setInterval(() => {
     void loadMarkets().catch(() => {});
   }, 30_000);
-  setInterval(paintNow, 15_000);
+  setInterval(paintNow, 5_000);
 })();

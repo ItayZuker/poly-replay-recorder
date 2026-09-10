@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Poly Recorder</title>
-    <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/style.css?v=3" />
   </head>
   <body>
     <div class="app">
@@ -19,22 +19,25 @@
           </div>
         </div>
         <div class="header-end">
-          <button
-            type="button"
-            id="recording-switch"
-            class="recording-switch"
-            aria-pressed="false"
-            title="Same Mongo Recording flag as Admin CRM"
-          >
-            <span class="recording-switch-knob"></span>
-            <span class="recording-switch-label">Off</span>
-          </button>
+          <div class="recording-switch-wrap">
+            <span class="recording-switch-caption">Recording</span>
+            <button
+              type="button"
+              id="recording-switch"
+              class="recording-switch"
+              aria-pressed="false"
+              title="Same Mongo Recording flag as Admin CRM"
+            >
+              <span class="recording-switch-knob"></span>
+              <span class="recording-switch-label">Off</span>
+            </button>
+          </div>
         </div>
       </header>
       <main class="week-wrap">
         <div class="week-grid" id="week-grid"></div>
       </main>
     </div>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=3"></script>
   </body>
 </html>

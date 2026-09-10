@@ -196,6 +196,25 @@ async function windowHasNonEmptyTickFile(
   }
 }
 
+/** Window-start folder names under the market ticks dir (not file-quality filtered). */
+export async function listTickWindowStarts(series: string): Promise<number[]> {
+  const ticksRoot = marketTicksDir(series);
+  try {
+    const entries = await fs.readdir(ticksRoot, { withFileTypes: true });
+    const starts: number[] = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const windowStart = parseWindowStartFromFilename(entry.name);
+      if (windowStart != null) starts.push(windowStart);
+    }
+    return starts.sort((a, b) => a - b);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return [];
+    throw err;
+  }
+}
+
 /** Which window starts have a non-empty Chainlink tick file (cheap disk check). */
 export async function windowsHavingChainlinkTicks(
   market: MarketDocument,
