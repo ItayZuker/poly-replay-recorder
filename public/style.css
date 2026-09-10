@@ -1,0 +1,240 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --up: #2ea043;
+  --down: #f85149;
+  --topbar-height: 45px;
+  --header-control-height: 28px;
+  --header-control-label-inset: 8px;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  overflow: hidden;
+}
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.app-header {
+  position: relative;
+  width: 100%;
+  box-sizing: border-box;
+  height: var(--topbar-height);
+  min-height: var(--topbar-height);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+  flex-shrink: 0;
+}
+
+.app-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+
+.app-title-poly {
+  color: var(--down);
+}
+
+.app-title-recorder {
+  color: var(--up);
+}
+
+.header-nav {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.header-market-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.app-header select {
+  height: var(--header-control-height);
+  padding: 0 28px 0 var(--header-control-label-inset);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.app-header select:hover,
+.app-header select:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+.header-end {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.recording-switch {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--header-control-height);
+  padding: 0 10px 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.recording-switch-knob {
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: #3d444d;
+  position: relative;
+}
+
+.recording-switch-knob::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #c9d1d9;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+
+.recording-switch.is-on {
+  color: var(--up);
+  border-color: color-mix(in srgb, var(--up) 50%, var(--border));
+}
+
+.recording-switch.is-on .recording-switch-knob {
+  background: color-mix(in srgb, var(--up) 40%, #1b3d24);
+}
+
+.recording-switch.is-on .recording-switch-knob::after {
+  transform: translateX(14px);
+  background: var(--up);
+}
+
+.recording-switch:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.week-wrap {
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+  padding: 8px;
+}
+
+.week-grid {
+  height: 100%;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 44px repeat(7, minmax(0, 1fr));
+  grid-template-rows: 28px repeat(24, minmax(0, 1fr));
+  border: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.week-corner,
+.week-day,
+.week-hour {
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+
+.week-day {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.week-hour {
+  font-variant-numeric: tabular-nums;
+}
+
+.week-hour.is-now,
+.week-slot.is-now {
+  box-shadow: inset 0 0 0 2px rgba(239, 68, 68, 0.85);
+  z-index: 1;
+}
+
+.week-slot {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--down);
+  overflow: hidden;
+}
+
+.week-slot-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  background: var(--up);
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.week-slot-count {
+  position: relative;
+  z-index: 1;
+  padding: 0 5px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  line-height: 1;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.45);
+  pointer-events: none;
+}

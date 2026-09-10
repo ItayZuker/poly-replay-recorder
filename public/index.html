@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Poly Recorder</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="app-header">
+        <h1 class="app-title">
+          <span class="app-title-poly">Poly</span>
+          <span class="app-title-recorder">Recorder</span>
+        </h1>
+        <div class="header-nav">
+          <div class="header-market-row">
+            <select id="market-select" aria-label="Market"></select>
+          </div>
+        </div>
+        <div class="header-end">
+          <button
+            type="button"
+            id="recording-switch"
+            class="recording-switch"
+            aria-pressed="false"
+            title="Same Mongo Recording flag as Admin CRM"
+          >
+            <span class="recording-switch-knob"></span>
+            <span class="recording-switch-label">Off</span>
+          </button>
+        </div>
+      </header>
+      <main class="week-wrap">
+        <div class="week-grid" id="week-grid"></div>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
