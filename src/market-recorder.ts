@@ -59,10 +59,7 @@ import {
   recordingPtbFields,
   type PtbHistorySource,
 } from "./ptb-history.js";
-import {
-  deleteRecordedWindowSummary,
-  upsertRecordedWindowSummary,
-} from "./db/recorded-window-mongo-repository.js";
+import { deleteRecordedWindowSummary } from "./db/recorded-window-mongo-repository.js";
 import { pruneColdMarketData } from "./db/tick-archive.js";
 import {
   marketWindowsDir,
@@ -748,21 +745,6 @@ export class MarketRecorder {
     };
     try {
       await saveRecordedWindow(this.market, doc);
-      await upsertRecordedWindowSummary(this.market._id, {
-        windowStart: doc.windowStart,
-        windowEnd: doc.windowEnd,
-        savedAt,
-        ptbCrossings: doc.ptbCrossings,
-        rangeTop: doc.rangeTop,
-        rangeBottom: doc.rangeBottom,
-        windowOutcome: doc.windowOutcome,
-        minAssetPrice: doc.minAssetPrice,
-        maxAssetPrice: doc.maxAssetPrice,
-        assetRange: doc.assetRange,
-        prevCloseAsset: ptb,
-        assetPrice: doc.assetPrice,
-        ...recordingPtbFields(win),
-      });
     } catch (err) {
       logService.warn(
         "recorder",
@@ -771,7 +753,7 @@ export class MarketRecorder {
     }
   }
 
-  /** Create Mongo/disk stub at window open with PTB unset. */
+  /** Create Mongo stub at window open with PTB unset. */
   private async persistWindowStub(): Promise<void> {
     if (!this.activeWindow) return;
     const win = this.activeWindow;
@@ -790,11 +772,6 @@ export class MarketRecorder {
     };
     try {
       await saveRecordedWindow(this.market, doc);
-      await upsertRecordedWindowSummary(this.market._id, {
-        windowStart: doc.windowStart,
-        windowEnd: doc.windowEnd,
-        savedAt,
-      });
     } catch (err) {
       logService.warn(
         "recorder",
@@ -1148,26 +1125,6 @@ export class MarketRecorder {
       chainlinkCount: existing.chainlinkCount,
     };
     await saveRecordedWindow(this.market, nextDoc);
-    await upsertRecordedWindowSummary(this.market._id, {
-      windowStart: nextDoc.windowStart,
-      windowEnd: nextDoc.windowEnd,
-      savedAt: nextDoc.savedAt,
-      ptbCrossings: nextDoc.ptbCrossings,
-      rangeTop: nextDoc.rangeTop,
-      rangeBottom: nextDoc.rangeBottom,
-      windowOutcome: nextDoc.windowOutcome,
-      minAssetPrice: nextDoc.minAssetPrice,
-      maxAssetPrice: nextDoc.maxAssetPrice,
-      assetRange: nextDoc.assetRange,
-      prevCloseAsset: nextDoc.prevCloseAsset,
-      assetPrice: nextDoc.assetPrice,
-      ...recordingPtbFields(nextDoc),
-    }).catch((err) => {
-      logService.warn(
-        "recorder",
-        `Mongo recorded_windows upsert failed (${this.market._id}): ${String(err)}`,
-      );
-    });
     this.onStateChange?.(this.market._id);
   }
 
@@ -1365,26 +1322,6 @@ export class MarketRecorder {
         chainlinkCount: this.chainlinkCount,
       };
       await saveRecordedWindow(this.market, recordedDoc);
-      await upsertRecordedWindowSummary(this.market._id, {
-        windowStart: recordedDoc.windowStart,
-        windowEnd: recordedDoc.windowEnd,
-        savedAt,
-        ptbCrossings: recordedDoc.ptbCrossings,
-        rangeTop: recordedDoc.rangeTop,
-        rangeBottom: recordedDoc.rangeBottom,
-        windowOutcome: recordedDoc.windowOutcome,
-        minAssetPrice: recordedDoc.minAssetPrice,
-        maxAssetPrice: recordedDoc.maxAssetPrice,
-        assetRange: recordedDoc.assetRange,
-        prevCloseAsset: recordedDoc.prevCloseAsset,
-        assetPrice: recordedDoc.assetPrice,
-        ...recordingPtbFields(recordedDoc),
-      }).catch((err) => {
-        logService.warn(
-          "recorder",
-          `Mongo recorded_windows upsert failed (${this.market._id}): ${String(err)}`,
-        );
-      });
 
       // Immediate Gamma settle at finalize: stamp official close tip (same as background path).
       if (

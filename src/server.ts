@@ -14,6 +14,7 @@ import { recordingManager } from "./recording-manager.js";
 import { startArchiveScheduler, stopArchiveScheduler } from "./archive-service.js";
 import { logService } from "./log-service.js";
 import { getWeekCoverage } from "./week-coverage.js";
+import { backfillLocalWindowsToMongo } from "./db/backfill-windows-to-mongo.js";
 
 const PORT = Number(process.env.PORT) || 3849;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -29,6 +30,10 @@ function parseSeries(raw: unknown): string {
 async function main(): Promise<void> {
   await initStorage();
   await Promise.all(SEED_MARKETS.map((m) => ensureMarketDirs(m.series)));
+  const backfilled = await backfillLocalWindowsToMongo();
+  if (backfilled > 0) {
+    logService.info("recorder", `Backfilled ${backfilled} window header(s) from local JSON to Mongo`);
+  }
 
   const app = express();
   app.use(express.json({ limit: "32kb" }));

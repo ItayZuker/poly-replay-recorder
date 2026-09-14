@@ -1,72 +1,53 @@
 import type { MarketDocument, RecordedWindowDocument } from "../types.js";
+import { getWeekHistoryCutoffUtcSec } from "../day-hour-slots.js";
 import {
   fromStoredRecordedWindow,
-  toStoredRecordedWindow,
   type StoredWindowDocument,
-  WK,
 } from "../window-compact.js";
-import { marketWindowsDir, parseWindowStartFromFilename } from "./data-dir.js";
-import { deleteWindowFilesBefore, listWindowFiles, readJsonFile, writeJsonFile } from "./file-store.js";
-import fs from "fs/promises";
+import { marketWindowsDir } from "./data-dir.js";
+import { listWindowFiles, readJsonFile } from "./file-store.js";
+import {
+  deleteRecordedWindowSummary,
+  getRecordedWindowSummary,
+  listRecordedWindowStarts as listMongoWindowStarts,
+  listRecordedWindowsSince,
+  summaryToRecordedWindow,
+  upsertRecordedWindowSummary,
+} from "./recorded-window-mongo-repository.js";
 import path from "path";
 
 /**
- * Local JSON window files under data/{series}/windows — legacy offline helpers.
- * Replay slot counts use Mongo (`recorded-window-mongo-repository`).
- * Prefer Mongo for any new code paths.
+ * Window headers live in Mongo `recorded_windows`.
+ * Local `windows/*.json` is read only for one-time backfill.
  */
-
-function windowFilePath(market: MarketDocument, windowStart: number): string {
-  return path.join(marketWindowsDir(market._id), `${windowStart}.json`);
-}
 
 export async function saveRecordedWindow(
   market: MarketDocument,
   doc: Omit<RecordedWindowDocument, "_id" | "updatedAt">,
 ): Promise<void> {
-  const now = new Date().toISOString();
-  const stored = toStoredRecordedWindow({ ...doc, updatedAt: now });
-  await writeJsonFile(windowFilePath(market, doc.windowStart), stored);
+  await upsertRecordedWindowSummary(market._id, {
+    ...doc,
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 export async function getRecordedWindow(
   market: MarketDocument,
   windowStart: number,
 ): Promise<RecordedWindowDocument | null> {
-  const doc = await readJsonFile<StoredWindowDocument>(windowFilePath(market, windowStart));
-  return doc ? fromStoredRecordedWindow(doc) : null;
+  const summary = await getRecordedWindowSummary(market._id, windowStart);
+  return summary ? summaryToRecordedWindow(summary) : null;
 }
 
-/** Finished window starts (JSON written at finalize). */
 export async function listRecordedWindowStarts(series: string): Promise<number[]> {
-  const files = await listWindowFiles(marketWindowsDir(series));
-  const starts: number[] = [];
-  for (const filename of files) {
-    const windowStart = parseWindowStartFromFilename(filename);
-    if (windowStart != null) starts.push(windowStart);
-  }
-  return starts.sort((a, b) => a - b);
+  return listMongoWindowStarts(series, getWeekHistoryCutoffUtcSec());
 }
 
 export async function listRecordedWindows(
   market: MarketDocument,
 ): Promise<RecordedWindowDocument[]> {
-  const dir = marketWindowsDir(market._id);
-  const files = await listWindowFiles(dir);
-  const windows = await Promise.all(
-    files.map(async (filename) => {
-      try {
-        const doc = await readJsonFile<StoredWindowDocument>(path.join(dir, filename));
-        return doc ? fromStoredRecordedWindow(doc) : null;
-      } catch {
-        // Skip corrupt / truncated JSON (Dropbox sync collisions, etc.).
-        return null;
-      }
-    }),
-  );
-  return windows
-    .filter((window): window is RecordedWindowDocument => window != null)
-    .sort((a, b) => a.windowStart - b.windowStart);
+  const summaries = await listRecordedWindowsSince(getWeekHistoryCutoffUtcSec(), market._id);
+  return summaries.map(summaryToRecordedWindow);
 }
 
 export async function getWindowDataVersion(
@@ -81,25 +62,38 @@ export async function getWindowDataVersion(
   return `${latest.windowStart}:${latest.savedAt}`;
 }
 
+/** Local JSON prune is a no-op — Mongo retention is `deleteRecordedWindowsBefore`. */
 export async function pruneRecordedWindows(
-  market: MarketDocument,
-  cutoff: number,
+  _market: MarketDocument,
+  _cutoff: number,
 ): Promise<number> {
-  return deleteWindowFilesBefore(marketWindowsDir(market._id), cutoff);
+  return 0;
 }
 
-/** Delete one local window JSON (series id, not MarketDocument). */
 export async function deleteRecordedWindowFile(
   series: string,
   windowStart: number,
 ): Promise<void> {
-  const filePath = path.join(marketWindowsDir(series), `${windowStart}.json`);
-  try {
-    await fs.unlink(filePath);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT") throw err;
-  }
+  await deleteRecordedWindowSummary(series, windowStart);
 }
 
-export { WK };
+/** Disk headers for migrating into Mongo. */
+export async function listLocalRecordedWindows(
+  market: MarketDocument,
+): Promise<RecordedWindowDocument[]> {
+  const dir = marketWindowsDir(market._id);
+  const files = await listWindowFiles(dir);
+  const windows = await Promise.all(
+    files.map(async (filename) => {
+      try {
+        const doc = await readJsonFile<StoredWindowDocument>(path.join(dir, filename));
+        return doc ? fromStoredRecordedWindow(doc) : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return windows
+    .filter((window): window is RecordedWindowDocument => window != null)
+    .sort((a, b) => a.windowStart - b.windowStart);
+}

@@ -195,6 +195,9 @@ export function fromStoredRecordedWindow(doc: StoredWindowDocument): RecordedWin
       newWallets: doc.newWallets as number | undefined,
       knownWallets: doc.knownWallets as number | undefined,
       tickCount: Number(doc.tickCount),
+      clobRawCount: doc.clobRawCount as number | undefined,
+      clobBookCount: doc.clobBookCount as number | undefined,
+      chainlinkCount: doc.chainlinkCount as number | undefined,
       ptbHistory: decodePtbHistory(doc.ptbHistory ?? doc[WK.ptbHistory]),
       gammaPtb: (doc.gammaPtb ?? doc[WK.gammaPtb]) as number | undefined,
     });

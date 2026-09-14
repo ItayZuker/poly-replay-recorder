@@ -6,7 +6,6 @@ import type { MarketDocument } from "../types.js";
 import {
   marketArchiveDir,
   marketTicksDir,
-  marketWindowsDir,
   parseWindowStartFromFilename,
 } from "./data-dir.js";
 import { pruneRecordedWindows } from "./recorded-window-repository.js";

@@ -1,10 +1,10 @@
-import type { PtbHistoryEntry, WindowOutcome } from "../types.js";
+import type { PtbHistoryEntry, RecordedWindowDocument, WindowOutcome } from "../types.js";
 import { decodePtbHistory, encodePtbHistory } from "../ptb-history.js";
 import { getMongoClient, getMongoDbName } from "./mongo-client.js";
 
 const COLLECTION = "recorded_windows";
 
-/** Slim window summary used by Replay slot counts and Open Replay (Mongo). */
+/** Window summary in Mongo — dest Replay reads the original slim fields; extras are ignored. */
 export interface RecordedWindowSummary {
   series: string;
   windowStart: number;
@@ -15,6 +15,7 @@ export interface RecordedWindowSummary {
   rangeBottom?: number;
   uniqueTraders?: number;
   newWallets?: number;
+  knownWallets?: number;
   windowOutcome?: WindowOutcome;
   minAssetPrice?: number;
   maxAssetPrice?: number;
@@ -25,7 +26,21 @@ export interface RecordedWindowSummary {
   assetPrice?: number;
   ptbHistory?: PtbHistoryEntry[];
   gammaPtb?: number;
+  slug?: string;
+  question?: string;
+  conditionId?: string;
+  yesPrice?: number;
+  noPrice?: number;
+  assetGap?: number;
+  tickCount?: number;
+  clobRawCount?: number;
+  clobBookCount?: number;
+  chainlinkCount?: number;
 }
+
+export type RecordedWindowWrite = Omit<RecordedWindowDocument, "_id" | "updatedAt"> & {
+  updatedAt?: string;
+};
 
 type MongoRecordedWindowDoc = {
   _id?: string | undefined;
@@ -34,11 +49,13 @@ type MongoRecordedWindowDoc = {
   windowStart?: number;
   windowEnd?: number;
   savedAt?: string | Date;
+  updatedAt?: string | Date;
   ptbCrossings?: number;
   rangeTop?: number;
   rangeBottom?: number;
   uniqueTraders?: number;
   newWallets?: number;
+  knownWallets?: number;
   windowOutcome?: WindowOutcome | null;
   minAssetPrice?: number;
   maxAssetPrice?: number;
@@ -47,6 +64,16 @@ type MongoRecordedWindowDoc = {
   assetPrice?: number;
   ptbHistory?: unknown;
   gammaPtb?: number;
+  slug?: string;
+  question?: string;
+  conditionId?: string;
+  yesPrice?: number;
+  noPrice?: number;
+  assetGap?: number;
+  tickCount?: number;
+  clobRawCount?: number;
+  clobBookCount?: number;
+  chainlinkCount?: number;
   /** Legacy nested payload from older sim writers. */
   window?: {
     windowStart?: number;
@@ -86,6 +113,18 @@ const WINDOW_SUMMARY_PROJECTION = {
   assetPrice: 1,
   ptbHistory: 1,
   gammaPtb: 1,
+  slug: 1,
+  question: 1,
+  conditionId: 1,
+  yesPrice: 1,
+  noPrice: 1,
+  assetGap: 1,
+  tickCount: 1,
+  clobRawCount: 1,
+  clobBookCount: 1,
+  chainlinkCount: 1,
+  knownWallets: 1,
+  updatedAt: 1,
   "window.windowStart": 1,
   "window.windowEnd": 1,
   "window.savedAt": 1,
@@ -159,60 +198,102 @@ function normalizeDoc(doc: MongoRecordedWindowDoc): RecordedWindowSummary | null
   if (ptbHistory) out.ptbHistory = ptbHistory;
   if (doc.gammaPtb != null && Number.isFinite(doc.gammaPtb)) out.gammaPtb = doc.gammaPtb;
   if (windowOutcome === "up" || windowOutcome === "down") out.windowOutcome = windowOutcome;
+  if (typeof doc.slug === "string" && doc.slug.trim()) out.slug = doc.slug.trim();
+  if (typeof doc.question === "string" && doc.question.trim()) out.question = doc.question.trim();
+  if (typeof doc.conditionId === "string" && doc.conditionId.trim()) {
+    out.conditionId = doc.conditionId.trim();
+  }
+  if (doc.yesPrice != null && Number.isFinite(doc.yesPrice)) out.yesPrice = doc.yesPrice;
+  if (doc.noPrice != null && Number.isFinite(doc.noPrice)) out.noPrice = doc.noPrice;
+  if (doc.assetGap != null && Number.isFinite(doc.assetGap)) out.assetGap = doc.assetGap;
+  if (doc.tickCount != null && Number.isFinite(doc.tickCount)) out.tickCount = doc.tickCount;
+  if (doc.clobRawCount != null && Number.isFinite(doc.clobRawCount)) out.clobRawCount = doc.clobRawCount;
+  if (doc.clobBookCount != null && Number.isFinite(doc.clobBookCount)) out.clobBookCount = doc.clobBookCount;
+  if (doc.chainlinkCount != null && Number.isFinite(doc.chainlinkCount)) {
+    out.chainlinkCount = doc.chainlinkCount;
+  }
+  if (doc.knownWallets != null && Number.isFinite(doc.knownWallets)) out.knownWallets = doc.knownWallets;
 
   return out;
 }
 
-/** Upsert slim recorded-window fields for one finished window (recorder role). */
-export async function upsertRecordedWindowSummary(
+export function summaryToRecordedWindow(summary: RecordedWindowSummary): RecordedWindowDocument {
+  return {
+    _id: `${summary.series}:${summary.windowStart}`,
+    windowStart: summary.windowStart,
+    windowEnd: summary.windowEnd,
+    savedAt: summary.savedAt,
+    updatedAt: summary.savedAt,
+    slug: summary.slug,
+    question: summary.question,
+    conditionId: summary.conditionId,
+    assetPrice: summary.assetPrice,
+    prevCloseAsset: summary.prevCloseAsset,
+    ptbHistory: summary.ptbHistory,
+    gammaPtb: summary.gammaPtb,
+    assetGap: summary.assetGap,
+    windowOutcome: summary.windowOutcome,
+    yesPrice: summary.yesPrice,
+    noPrice: summary.noPrice,
+    ptbCrossings: summary.ptbCrossings,
+    minAssetPrice: summary.minAssetPrice,
+    maxAssetPrice: summary.maxAssetPrice,
+    assetRange: summary.assetRange,
+    rangeTop: summary.rangeTop,
+    rangeBottom: summary.rangeBottom,
+    uniqueTraders: summary.uniqueTraders,
+    newWallets: summary.newWallets,
+    knownWallets: summary.knownWallets,
+    tickCount: summary.tickCount ?? 0,
+    clobRawCount: summary.clobRawCount,
+    clobBookCount: summary.clobBookCount,
+    chainlinkCount: summary.chainlinkCount,
+  };
+}
+
+function setNum(target: MongoRecordedWindowDoc, key: keyof MongoRecordedWindowDoc, value: unknown): void {
+  const n = Number(value);
+  if (Number.isFinite(n)) (target as Record<string, unknown>)[key as string] = n;
+}
+
+function setStr(target: MongoRecordedWindowDoc, key: keyof MongoRecordedWindowDoc, value: unknown): void {
+  if (typeof value === "string" && value.trim()) {
+    (target as Record<string, unknown>)[key as string] = value.trim();
+  }
+}
+
+function buildWindowSet(
   series: string,
-  window: {
-    windowStart: number;
-    windowEnd: number;
-    savedAt: string;
-    ptbCrossings?: number;
-    rangeTop?: number;
-    rangeBottom?: number;
-    uniqueTraders?: number;
-    newWallets?: number;
-    windowOutcome?: WindowOutcome;
-    minAssetPrice?: number;
-    maxAssetPrice?: number;
-    assetRange?: number;
-    prevCloseAsset?: number;
-    assetPrice?: number;
-    ptbHistory?: PtbHistoryEntry[];
-    gammaPtb?: number;
-  },
-): Promise<void> {
-  const mongo = await getMongoClient();
-  const _id = `${series}:${window.windowStart}`;
+  window: RecordedWindowWrite,
+): { $set: MongoRecordedWindowDoc; $unset?: Record<string, ""> } {
   const $set: MongoRecordedWindowDoc = {
     series,
     windowStart: window.windowStart,
     windowEnd: window.windowEnd,
     savedAt: window.savedAt,
   };
-  if (window.ptbCrossings != null) $set.ptbCrossings = window.ptbCrossings;
-  if (window.rangeTop != null) $set.rangeTop = window.rangeTop;
-  if (window.rangeBottom != null) $set.rangeBottom = window.rangeBottom;
-  if (window.uniqueTraders != null) $set.uniqueTraders = window.uniqueTraders;
-  if (window.newWallets != null) $set.newWallets = window.newWallets;
-  if (window.minAssetPrice != null && Number.isFinite(window.minAssetPrice)) {
-    $set.minAssetPrice = window.minAssetPrice;
-  }
-  if (window.maxAssetPrice != null && Number.isFinite(window.maxAssetPrice)) {
-    $set.maxAssetPrice = window.maxAssetPrice;
-  }
-  if (window.assetRange != null && Number.isFinite(window.assetRange)) {
-    $set.assetRange = window.assetRange;
-  }
-  if (window.prevCloseAsset != null && Number.isFinite(window.prevCloseAsset)) {
-    $set.prevCloseAsset = window.prevCloseAsset;
-  }
-  if (window.assetPrice != null && Number.isFinite(window.assetPrice)) {
-    $set.assetPrice = window.assetPrice;
-  }
+  if (window.updatedAt) $set.updatedAt = window.updatedAt;
+  setStr($set, "slug", window.slug);
+  setStr($set, "question", window.question);
+  setStr($set, "conditionId", window.conditionId);
+  setNum($set, "ptbCrossings", window.ptbCrossings);
+  setNum($set, "rangeTop", window.rangeTop);
+  setNum($set, "rangeBottom", window.rangeBottom);
+  setNum($set, "uniqueTraders", window.uniqueTraders);
+  setNum($set, "newWallets", window.newWallets);
+  setNum($set, "knownWallets", window.knownWallets);
+  setNum($set, "minAssetPrice", window.minAssetPrice);
+  setNum($set, "maxAssetPrice", window.maxAssetPrice);
+  setNum($set, "assetRange", window.assetRange);
+  setNum($set, "prevCloseAsset", window.prevCloseAsset);
+  setNum($set, "assetPrice", window.assetPrice);
+  setNum($set, "yesPrice", window.yesPrice);
+  setNum($set, "noPrice", window.noPrice);
+  setNum($set, "assetGap", window.assetGap);
+  setNum($set, "tickCount", window.tickCount);
+  setNum($set, "clobRawCount", window.clobRawCount);
+  setNum($set, "clobBookCount", window.clobBookCount);
+  setNum($set, "chainlinkCount", window.chainlinkCount);
   const ptbHistory = encodePtbHistory(window.ptbHistory);
   if (ptbHistory) $set.ptbHistory = ptbHistory;
   if (window.gammaPtb != null && Number.isFinite(window.gammaPtb)) {
@@ -227,11 +308,40 @@ export async function upsertRecordedWindowSummary(
   if (window.windowOutcome === "up" || window.windowOutcome === "down") {
     update.$unset = { "window.windowOutcome": "" };
   }
+  return update;
+}
 
+/** Upsert one window header (full local-JSON field set; dest ignores unknown keys). */
+export async function upsertRecordedWindowSummary(
+  series: string,
+  window: RecordedWindowWrite,
+): Promise<void> {
+  const mongo = await getMongoClient();
+  const _id = `${series}:${window.windowStart}`;
   await mongo
     .db(getMongoDbName())
     .collection<MongoRecordedWindowDoc>(COLLECTION)
-    .updateOne({ _id }, update, { upsert: true });
+    .updateOne({ _id }, buildWindowSet(series, window), { upsert: true });
+}
+
+export async function upsertRecordedWindowSummaries(
+  series: string,
+  windows: RecordedWindowWrite[],
+): Promise<number> {
+  if (windows.length === 0) return 0;
+  const mongo = await getMongoClient();
+  const ops = windows.map((window) => ({
+    updateOne: {
+      filter: { _id: `${series}:${window.windowStart}` },
+      update: buildWindowSet(series, window),
+      upsert: true,
+    },
+  }));
+  const result = await mongo
+    .db(getMongoDbName())
+    .collection<MongoRecordedWindowDoc>(COLLECTION)
+    .bulkWrite(ops, { ordered: false });
+  return (result.upsertedCount ?? 0) + (result.modifiedCount ?? 0) + (result.matchedCount ?? 0);
 }
 
 /** Delete one Mongo recorded_windows summary. */
@@ -313,4 +423,12 @@ export async function getRecordedWindowSummary(
   const normalized = normalizeDoc(doc);
   if (!normalized || normalized.series !== ser) return null;
   return normalized;
+}
+
+export async function listRecordedWindowStarts(
+  series: string,
+  cutoffUtc = 0,
+): Promise<number[]> {
+  const windows = await listRecordedWindowsSince(cutoffUtc, series);
+  return windows.map((window) => window.windowStart);
 }
