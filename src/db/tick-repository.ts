@@ -6,12 +6,16 @@ import type {
 } from "../types.js";
 import {
   chainlinkTicksPath,
+  chainlinkTicksZstPath,
   clobBookTicksPath,
   clobRawTicksPath,
+  clobRawTicksZstPath,
   marketTicksDir,
   parseWindowStartFromFilename,
   windowTicksDir,
 } from "./data-dir.js";
+import { readJsonlZstLines } from "./tick-zst.js";
+import { OFFICIAL_RESOLVE_MAX_WAIT_MS } from "../official-window-resolution.js";
 import { appendJsonlLines, readJsonlFile, writeJsonlFile } from "./file-store.js";
 import {
   fromStoredBookTick,
@@ -44,7 +48,7 @@ async function loadWrittenTickIds(filePath: string): Promise<Set<string>> {
   return known;
 }
 
-function forgetWrittenTickIds(filePath: string): void {
+export function forgetWrittenTickIds(filePath: string): void {
   writtenTickIdsByFile.delete(filePath);
 }
 
@@ -125,6 +129,26 @@ export async function listClobRawTicks(
   limit = 10_000,
 ): Promise<ClobRawTickDocument[]> {
   return readJsonlFile<ClobRawTickDocument>(clobRawTicksPath(market._id, windowStart), limit);
+}
+
+/** Dest Replay: zst only. Missing file = empty. */
+export async function listReplayClobRawTicks(
+  market: MarketDocument,
+  windowStart: number,
+): Promise<ClobRawTickDocument[]> {
+  const rows = await readJsonlZstLines(clobRawTicksZstPath(market._id, windowStart));
+  return rows as ClobRawTickDocument[];
+}
+
+/** Dest Replay: zst only. Missing file = empty. */
+export async function listReplayChainlinkTicks(
+  market: MarketDocument,
+  windowStart: number,
+): Promise<ChainlinkTickDocument[]> {
+  const rows = await readJsonlZstLines<StoredTickDocument>(
+    chainlinkTicksZstPath(market._id, windowStart),
+  );
+  return rows.map((row) => fromStoredChainlinkTick(row));
 }
 
 export async function listClobBookTicks(
@@ -288,16 +312,20 @@ export async function windowsHavingClobBookTicks(
   return present.sort((a, b) => a - b);
 }
 
-async function windowHasUsablePricePath(
+export type WindowChipState = "missing" | "pending" | "recorded";
+
+async function windowHasUsableZstPricePath(
   market: MarketDocument,
   windowStart: number,
 ): Promise<boolean> {
-  const key = `${market._id}:${windowStart}`;
+  const key = `${market._id}:${windowStart}:zst`;
   if (usableWindowCache.has(key)) return true;
   const winSec = (market.timeframeMinutes === 15 ? 15 : 5) * 60;
   const endedAt = windowStart + winSec;
-  if (Date.now() / 1000 < endedAt + COVERAGE_FLUSH_GRACE_SEC) return false;
-  const ticks = await listChainlinkTicks(market, windowStart);
+  const rows = await readJsonlZstLines<StoredTickDocument>(
+    chainlinkTicksZstPath(market._id, windowStart),
+  );
+  const ticks = rows.map((doc) => fromStoredChainlinkTick(doc));
   const usable = !isUnusablePricePath(
     ticks.map((tick) => ({
       tMs: tick.tMs,
@@ -310,9 +338,48 @@ async function windowHasUsablePricePath(
   return usable;
 }
 
+/** Green chip: both zst files exist and the raw Chainlink path is usable. */
+export async function classifyWindowChip(
+  market: MarketDocument,
+  windowStart: number,
+  nowSec = Math.floor(Date.now() / 1000),
+): Promise<WindowChipState> {
+  const winSec = (market.timeframeMinutes === 15 ? 15 : 5) * 60;
+  const windowEnd = windowStart + winSec;
+  const [hasRawZst, hasChainZst] = await Promise.all([
+    windowHasNonEmptyTickFile(clobRawTicksZstPath(market._id, windowStart)),
+    windowHasNonEmptyTickFile(chainlinkTicksZstPath(market._id, windowStart)),
+  ]);
+  if (hasRawZst && hasChainZst) {
+    return (await windowHasUsableZstPricePath(market, windowStart))
+      ? "recorded"
+      : "missing";
+  }
+  if (nowSec < windowEnd) return "missing";
+  if (nowSec < windowEnd + OFFICIAL_RESOLVE_MAX_WAIT_MS / 1000) {
+    return "pending";
+  }
+  return "missing";
+}
+
+export async function classifyWindowChips(
+  market: MarketDocument,
+  windowStarts: number[],
+  nowSec = Math.floor(Date.now() / 1000),
+): Promise<Map<number, WindowChipState>> {
+  const out = new Map<number, WindowChipState>();
+  await Promise.all(
+    windowStarts.map(async (windowStart) => {
+      if (!Number.isFinite(windowStart)) return;
+      out.set(windowStart, await classifyWindowChip(market, windowStart, nowSec));
+    }),
+  );
+  return out;
+}
+
 /**
- * Grid / Replay: non-empty raw CLOB (or legacy book) + Chainlink, and a usable
- * raw Chainlink path (not empty, not flat, no ≥30s hole).
+ * Replay-ready windows: both `.jsonl.zst` files exist and Chainlink path is usable.
+ * Live JSONL is not Replay-ready.
  */
 export async function windowsHavingBookAndChainlinkTicks(
   market: MarketDocument,
@@ -322,19 +389,15 @@ export async function windowsHavingBookAndChainlinkTicks(
   await Promise.all(
     windowStarts.map(async (windowStart) => {
       if (!Number.isFinite(windowStart)) return;
-      const [hasRaw, hasBook, hasChainlink] = await Promise.all([
-        windowHasNonEmptyTickFile(clobRawTicksPath(market._id, windowStart)),
-        windowHasNonEmptyTickFile(clobBookTicksPath(market._id, windowStart)),
-        windowHasNonEmptyTickFile(chainlinkTicksPath(market._id, windowStart)),
-      ]);
-      if (!((hasRaw || hasBook) && hasChainlink)) return;
-      if (await windowHasUsablePricePath(market, windowStart)) present.push(windowStart);
+      if ((await classifyWindowChip(market, windowStart)) === "recorded") {
+        present.push(windowStart);
+      }
     }),
   );
   return present.sort((a, b) => a - b);
 }
 
-/** Replay-usable windows: files present and raw Chainlink path is usable. */
+/** Replay-usable windows: zst only. */
 export async function windowsHavingReplayTickFiles(
   market: MarketDocument,
   windowStarts: number[],

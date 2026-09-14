@@ -25,6 +25,9 @@ export interface OfficialWindowResolution {
   noPrice?: number;
 }
 
+/** After windowEnd, poll Gamma this long, then drop pending JSONL. */
+export const OFFICIAL_RESOLVE_MAX_WAIT_MS = 20 * 60 * 1000;
+
 /** True when a recording carries an explicit Gamma Up/Down settlement. */
 export function hasOfficialWindowOutcome(
   outcome: unknown,

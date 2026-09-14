@@ -13,6 +13,7 @@
   --accent: #58a6ff;
   --up: #2ea043;
   --down: #f85149;
+  --pending: #a371f7;
   --topbar-height: 45px;
   --header-control-height: 28px;
   --header-control-label-inset: 8px;
@@ -240,6 +241,10 @@ body {
 
 .week-slot-win.is-missing {
   background: var(--down);
+}
+
+.week-slot-win.is-pending {
+  background: var(--pending);
 }
 
 .week-slot-win.is-recorded {

@@ -3,6 +3,7 @@ import { ASSET_STALL_TIMEOUT_MS, chainlinkPriceFeed } from "./chainlink-price-fe
 import {
   fetchOfficialWindowResolution,
   hasOfficialWindowOutcome,
+  OFFICIAL_RESOLVE_MAX_WAIT_MS,
   waitForOfficialWindowResolution,
   type OfficialWindowResolution,
 } from "./official-window-resolution.js";
@@ -42,7 +43,14 @@ import {
   insertClobRawTicks,
 } from "./db/tick-repository.js";
 import {
+  deleteWindowJsonlTicks,
+  publishWindowTicksToZst,
+  windowHasLiveJsonlTicks,
+  windowHasReplayZst,
+} from "./db/tick-zst.js";
+import {
   getRecordedWindow,
+  listRecordedWindows,
   saveRecordedWindow,
 } from "./db/recorded-window-repository.js";
 import {
@@ -68,11 +76,6 @@ const CLOB_SILENCE_MS = 20_000;
 const CHAINLINK_SILENCE_MS = ASSET_STALL_TIMEOUT_MS;
 /** Ignore silence right after a window opens (pair/book may still be warming up). */
 const WINDOW_START_GRACE_MS = 20_000;
-/**
- * After windowEnd, poll Gamma every 30s for this long, then leave
- * windowOutcome / gammaPtb unset. Does not block the next window.
- */
-const OFFICIAL_RESOLVE_MAX_WAIT_MS = 20 * 60 * 1000;
 const OFFICIAL_RESOLVE_POLL_MS = 30_000;
 /** Official RTDS TWAP may update a bit slower than raw prints. */
 const OPEN_TWAP_MAX_AGE_MS = 90_000;
@@ -278,6 +281,7 @@ export class MarketRecorder {
     });
 
     logService.success("recorder", `Recording started for ${this.market._id}`);
+    void this.resumePendingTickPublish();
   }
 
   stop(): void {
@@ -827,6 +831,57 @@ export class MarketRecorder {
     }
   }
 
+  /** Restart-safe: finish zst publish / JSONL delete for windows still inside the 20m Gamma window. */
+  private async resumePendingTickPublish(): Promise<void> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const recentAfter =
+      nowSec - Math.floor(OFFICIAL_RESOLVE_MAX_WAIT_MS / 1000) - 60;
+    let windows;
+    try {
+      windows = await listRecordedWindows(this.market);
+    } catch (err) {
+      logService.warn(
+        "recorder",
+        `Could not resume pending tick publish for ${this.market._id}: ${String(err)}`,
+      );
+      return;
+    }
+
+    for (const win of windows) {
+      if (win.windowEnd < recentAfter) continue;
+      if (await windowHasReplayZst(this.market._id, win.windowStart)) continue;
+
+      if (hasOfficialWindowOutcome(win.windowOutcome)) {
+        if (await windowHasLiveJsonlTicks(this.market._id, win.windowStart)) {
+          const published = await publishWindowTicksToZst(
+            this.market._id,
+            win.windowStart,
+          );
+          logService.info(
+            "recorder",
+            `Resumed zst publish for ${this.market._id} ${win.windowStart} (${published})`,
+          );
+          this.onStateChange?.(this.market._id);
+        }
+        continue;
+      }
+
+      const deadlineSec = win.windowEnd + OFFICIAL_RESOLVE_MAX_WAIT_MS / 1000;
+      if (nowSec >= deadlineSec) {
+        await deleteWindowJsonlTicks(this.market._id, win.windowStart);
+        continue;
+      }
+
+      if (typeof win.slug === "string" && win.slug.trim()) {
+        this.scheduleBackgroundOfficialResolve({
+          windowStart: win.windowStart,
+          windowEnd: win.windowEnd,
+          slug: win.slug,
+        });
+      }
+    }
+  }
+
   /** Non-blocking: poll Gamma every 30s until windowEnd+20m, then leave unset. */
   private scheduleBackgroundOfficialResolve(input: {
     windowStart: number;
@@ -851,8 +906,10 @@ export class MarketRecorder {
     if (remainingMs <= 0) {
       logService.warn(
         "recorder",
-        `Official resolution past 20m for ${input.slug}; leaving Gamma PTB unset`,
+        `Official resolution past 20m for ${input.slug}; deleting JSONL`,
       );
+      await deleteWindowJsonlTicks(this.market._id, input.windowStart);
+      this.onStateChange?.(this.market._id);
       return;
     }
 
@@ -869,17 +926,21 @@ export class MarketRecorder {
     if (!official) {
       logService.warn(
         "recorder",
-        `Official resolution unavailable after 20m for ${input.slug}; leaving Gamma PTB unset`,
+        `Official resolution unavailable after 20m for ${input.slug}; deleting JSONL`,
       );
+      await deleteWindowJsonlTicks(this.market._id, input.windowStart);
+      this.onStateChange?.(this.market._id);
       return;
     }
 
     try {
       await this.applyOfficialResolutionToSavedWindow(input.windowStart, official);
+      const published = await publishWindowTicksToZst(this.market._id, input.windowStart);
       logService.success(
         "recorder",
-        `Background Gamma settled ${input.slug} → ${official.outcome}`,
+        `Background Gamma settled ${input.slug} → ${official.outcome} (${published})`,
       );
+      this.onStateChange?.(this.market._id);
     } catch (err) {
       logService.error(
         "recorder",
@@ -1123,8 +1184,10 @@ export class MarketRecorder {
       );
       this.onStateChange?.(this.market._id);
 
-      if (
-        !hasOfficialWindowOutcome(recordedDoc.windowOutcome) &&
+      if (hasOfficialWindowOutcome(recordedDoc.windowOutcome)) {
+        const published = await publishWindowTicksToZst(this.market._id, windowStart);
+        logService.info("recorder", `Published zst for ${this.market._id} (${published})`);
+      } else if (
         typeof recordedDoc.slug === "string" &&
         recordedDoc.slug.trim()
       ) {
@@ -1133,6 +1196,8 @@ export class MarketRecorder {
           windowEnd: recordedDoc.windowEnd,
           slug: recordedDoc.slug,
         });
+      } else {
+        await deleteWindowJsonlTicks(this.market._id, windowStart);
       }
     } catch (err) {
       logService.error("recorder", `Failed to finalize window (${this.market._id}): ${String(err)}`);

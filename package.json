@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@mongodb-js/zstd": "^7.0.0",
     "@polymarket/clob-client-v2": "^1.0.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",

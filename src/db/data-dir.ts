@@ -38,12 +38,20 @@ export function clobRawTicksPath(series: string, windowStart: number): string {
   return path.join(windowTicksDir(series, windowStart), "clob-raw.jsonl");
 }
 
+export function clobRawTicksZstPath(series: string, windowStart: number): string {
+  return path.join(windowTicksDir(series, windowStart), "clob-raw.jsonl.zst");
+}
+
 export function clobBookTicksPath(series: string, windowStart: number): string {
   return path.join(windowTicksDir(series, windowStart), "clob-book.jsonl");
 }
 
 export function chainlinkTicksPath(series: string, windowStart: number): string {
   return path.join(windowTicksDir(series, windowStart), "chainlink.jsonl");
+}
+
+export function chainlinkTicksZstPath(series: string, windowStart: number): string {
+  return path.join(windowTicksDir(series, windowStart), "chainlink.jsonl.zst");
 }
 
 export function marketWindowsDir(series: string): string {

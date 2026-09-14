@@ -78,7 +78,7 @@ function paintNow() {
   const chip = chips[currentChipIndex(chips.length || expectedPerHour)];
   if (!chip) return;
   chip.classList.add("is-live");
-  chip.classList.remove("is-missing", "is-recorded");
+  chip.classList.remove("is-missing", "is-pending", "is-recorded");
 }
 
 function fillSlotWindows(slot, expected) {
@@ -106,9 +106,12 @@ function paintCoverage(payload) {
       const row = byKey.get(`${day}:${hour}`);
       const flags = Array.isArray(row?.windows) ? row.windows : [];
       slot.querySelectorAll(".week-slot-win").forEach((chip, i) => {
-        const on = flags[i] === true;
-        chip.classList.toggle("is-recorded", on);
-        chip.classList.toggle("is-missing", !on);
+        const state = flags[i];
+        const recorded = state === "recorded" || state === true;
+        const pending = state === "pending";
+        chip.classList.toggle("is-recorded", recorded);
+        chip.classList.toggle("is-pending", pending);
+        chip.classList.toggle("is-missing", !recorded && !pending);
         chip.classList.remove("is-live");
       });
     }

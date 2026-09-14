@@ -5,9 +5,9 @@ import {
 } from "./day-hour-slots.js";
 import { getMarket } from "./db/market-repository.js";
 import {
-  COVERAGE_FLUSH_GRACE_SEC,
+  classifyWindowChips,
   listTickWindowStarts,
-  windowsHavingBookAndChainlinkTicks,
+  type WindowChipState,
 } from "./db/tick-repository.js";
 import { recordingManager } from "./recording-manager.js";
 
@@ -20,7 +20,7 @@ export interface HourSlotCoverage {
   recorded: number;
   expected: number;
   /** Index 0 is :00 in the hour; length is 12 (5m) or 4 (15m). */
-  windows: boolean[];
+  windows: WindowChipState[];
 }
 
 export interface WeekCoverage {
@@ -52,21 +52,35 @@ function utcHourStartSec(dayKey: string, hour: number): number {
   );
 }
 
-function windowFlagsForSlot(
-  starts: Set<number> | undefined,
+function windowStatesForHourStart(
+  byStart: Map<number, WindowChipState> | Set<number> | undefined,
   expected: number,
   winSec: number,
-): boolean[] {
-  const flags = Array.from({ length: expected }, () => false);
-  if (!starts || starts.size === 0) return flags;
-  const first = starts.values().next().value;
-  if (first == null) return flags;
-  const { dayKey, hour } = dayHourFromWindowStart(first);
-  const hourStart = utcHourStartSec(dayKey, hour);
-  for (let i = 0; i < expected; i += 1) {
-    flags[i] = starts.has(hourStart + i * winSec);
+  hourStart: number,
+): WindowChipState[] {
+  return Array.from({ length: expected }, (_, i) => {
+    const start = hourStart + i * winSec;
+    if (byStart instanceof Map) return byStart.get(start) ?? "missing";
+    if (byStart instanceof Set) return byStart.has(start) ? "recorded" : "missing";
+    return "missing";
+  });
+}
+
+function priorRecordedBySlot(recordedStarts: number[]): Map<string, Set<number>> {
+  const prior = selectLatestDayHourWindows(
+    recordedStarts.map((windowStart) => ({ windowStart })),
+  );
+  const priorBySlot = new Map<string, Set<number>>();
+  for (const { windowStart } of prior) {
+    const { slotKey } = dayHourFromWindowStart(windowStart);
+    let set = priorBySlot.get(slotKey);
+    if (!set) {
+      set = new Set();
+      priorBySlot.set(slotKey, set);
+    }
+    set.add(windowStart);
   }
-  return flags;
+  return priorBySlot;
 }
 
 /** This week's hour uses this week's files only once that hour starts; earlier hours stay last week. */
@@ -85,39 +99,35 @@ export async function getWeekCoverage(series: string): Promise<WeekCoverage> {
   const tickStarts = (await listTickWindowStarts(market._id)).filter(
     (windowStart) => windowStart >= cutoff,
   );
-  const complete = await windowsHavingBookAndChainlinkTicks(market, tickStarts);
-  const present = new Set(
-    complete.filter((windowStart) => windowStart + winSec + COVERAGE_FLUSH_GRACE_SEC <= nowSec),
+  const chipByStart = await classifyWindowChips(market, tickStarts, nowSec);
+  const recordedStarts = [...chipByStart.entries()]
+    .filter(([, state]) => state === "recorded")
+    .map(([windowStart]) => windowStart);
+  const priorBySlot = priorRecordedBySlot(
+    recordedStarts.filter((windowStart) => windowStart < weekStart),
   );
-  const prior = selectLatestDayHourWindows(
-    [...present]
-      .filter((windowStart) => windowStart < weekStart)
-      .map((windowStart) => ({ windowStart })),
-  );
-  const priorBySlot = new Map<string, Set<number>>();
-  for (const { windowStart } of prior) {
-    const { slotKey } = dayHourFromWindowStart(windowStart);
-    let set = priorBySlot.get(slotKey);
-    if (!set) {
-      set = new Set();
-      priorBySlot.set(slotKey, set);
-    }
-    set.add(windowStart);
-  }
 
   const slots: HourSlotCoverage[] = [];
   for (let dayIndex = 0; dayIndex < WEEK_DAYS.length; dayIndex += 1) {
     const day = WEEK_DAYS[dayIndex];
     for (let hour = 0; hour < 24; hour += 1) {
       const thisWeekHour = weekStart + dayIndex * 86_400 + hour * 3_600;
-      const windows =
-        nowSec >= thisWeekHour
-          ? Array.from({ length: expected }, (_, i) => present.has(thisWeekHour + i * winSec))
-          : windowFlagsForSlot(priorBySlot.get(`${day}:${hour}`), expected, winSec);
+      let windows: WindowChipState[];
+      if (nowSec >= thisWeekHour) {
+        windows = windowStatesForHourStart(chipByStart, expected, winSec, thisWeekHour);
+      } else {
+        const priorStarts = priorBySlot.get(`${day}:${hour}`);
+        const first = priorStarts?.values().next().value;
+        const hourStart =
+          first != null
+            ? utcHourStartSec(dayHourFromWindowStart(first).dayKey, hour)
+            : thisWeekHour;
+        windows = windowStatesForHourStart(priorStarts, expected, winSec, hourStart);
+      }
       slots.push({
         day,
         hour,
-        recorded: windows.filter(Boolean).length,
+        recorded: windows.filter((state) => state === "recorded").length,
         expected,
         windows,
       });
