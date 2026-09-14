@@ -1,4 +1,4 @@
-/** Recorded PTB timeline: first Chainlink tick, REST openPrice changes, Gamma at window end. */
+/** Recorded PTB timeline: first Chainlink tick, then Gamma at window end. */
 
 export type PtbHistorySource = "chainlink" | "rest" | "gamma";
 
@@ -120,9 +120,29 @@ export function decodePtbHistory(raw: unknown): PtbHistoryEntry[] | undefined {
 export function recordingPtbFields(doc: {
   ptbHistory?: PtbHistoryEntry[];
   gammaPtb?: number;
-}): { ptbHistory?: PtbHistoryEntry[]; gammaPtb?: number } {
-  const out: { ptbHistory?: PtbHistoryEntry[]; gammaPtb?: number } = {};
+  ptbChainlink?: number;
+  ptbTwap30?: number;
+  ptbTwap60?: number;
+}): {
+  ptbHistory?: PtbHistoryEntry[];
+  gammaPtb?: number;
+  ptbChainlink?: number;
+  ptbTwap30?: number;
+  ptbTwap60?: number;
+} {
+  const out: {
+    ptbHistory?: PtbHistoryEntry[];
+    gammaPtb?: number;
+    ptbChainlink?: number;
+    ptbTwap30?: number;
+    ptbTwap60?: number;
+  } = {};
   if (doc.ptbHistory?.length) out.ptbHistory = doc.ptbHistory;
   if (doc.gammaPtb != null && Number.isFinite(doc.gammaPtb)) out.gammaPtb = doc.gammaPtb;
+  if (doc.ptbChainlink != null && Number.isFinite(doc.ptbChainlink)) {
+    out.ptbChainlink = doc.ptbChainlink;
+  }
+  if (doc.ptbTwap30 != null && Number.isFinite(doc.ptbTwap30)) out.ptbTwap30 = doc.ptbTwap30;
+  if (doc.ptbTwap60 != null && Number.isFinite(doc.ptbTwap60)) out.ptbTwap60 = doc.ptbTwap60;
   return out;
 }

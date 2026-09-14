@@ -26,6 +26,9 @@ export interface RecordedWindowSummary {
   assetPrice?: number;
   ptbHistory?: PtbHistoryEntry[];
   gammaPtb?: number;
+  ptbChainlink?: number;
+  ptbTwap30?: number;
+  ptbTwap60?: number;
   slug?: string;
   question?: string;
   conditionId?: string;
@@ -64,6 +67,9 @@ type MongoRecordedWindowDoc = {
   assetPrice?: number;
   ptbHistory?: unknown;
   gammaPtb?: number;
+  ptbChainlink?: number;
+  ptbTwap30?: number;
+  ptbTwap60?: number;
   slug?: string;
   question?: string;
   conditionId?: string;
@@ -113,6 +119,9 @@ const WINDOW_SUMMARY_PROJECTION = {
   assetPrice: 1,
   ptbHistory: 1,
   gammaPtb: 1,
+  ptbChainlink: 1,
+  ptbTwap30: 1,
+  ptbTwap60: 1,
   slug: 1,
   question: 1,
   conditionId: 1,
@@ -197,6 +206,11 @@ function normalizeDoc(doc: MongoRecordedWindowDoc): RecordedWindowSummary | null
   const ptbHistory = decodePtbHistory(doc.ptbHistory);
   if (ptbHistory) out.ptbHistory = ptbHistory;
   if (doc.gammaPtb != null && Number.isFinite(doc.gammaPtb)) out.gammaPtb = doc.gammaPtb;
+  if (doc.ptbChainlink != null && Number.isFinite(doc.ptbChainlink)) {
+    out.ptbChainlink = doc.ptbChainlink;
+  }
+  if (doc.ptbTwap30 != null && Number.isFinite(doc.ptbTwap30)) out.ptbTwap30 = doc.ptbTwap30;
+  if (doc.ptbTwap60 != null && Number.isFinite(doc.ptbTwap60)) out.ptbTwap60 = doc.ptbTwap60;
   if (windowOutcome === "up" || windowOutcome === "down") out.windowOutcome = windowOutcome;
   if (typeof doc.slug === "string" && doc.slug.trim()) out.slug = doc.slug.trim();
   if (typeof doc.question === "string" && doc.question.trim()) out.question = doc.question.trim();
@@ -231,6 +245,9 @@ export function summaryToRecordedWindow(summary: RecordedWindowSummary): Recorde
     prevCloseAsset: summary.prevCloseAsset,
     ptbHistory: summary.ptbHistory,
     gammaPtb: summary.gammaPtb,
+    ptbChainlink: summary.ptbChainlink,
+    ptbTwap30: summary.ptbTwap30,
+    ptbTwap60: summary.ptbTwap60,
     assetGap: summary.assetGap,
     windowOutcome: summary.windowOutcome,
     yesPrice: summary.yesPrice,
@@ -299,6 +316,9 @@ function buildWindowSet(
   if (window.gammaPtb != null && Number.isFinite(window.gammaPtb)) {
     $set.gammaPtb = window.gammaPtb;
   }
+  setNum($set, "ptbChainlink", window.ptbChainlink);
+  setNum($set, "ptbTwap30", window.ptbTwap30);
+  setNum($set, "ptbTwap60", window.ptbTwap60);
   if (window.windowOutcome === "up" || window.windowOutcome === "down") {
     $set.windowOutcome = window.windowOutcome;
   }

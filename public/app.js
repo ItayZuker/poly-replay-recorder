@@ -10,6 +10,7 @@ let markets = [];
 let selectedSeries = "btc-5m";
 let switchBusy = false;
 let expectedPerHour = 12;
+let liveBothSockets = false;
 
 function padHour(hour) {
   return `${String(hour).padStart(2, "0")}:00`;
@@ -70,7 +71,7 @@ function paintNow() {
   grid.querySelectorAll(".week-slot-win.is-live").forEach((el) => el.classList.remove("is-live"));
   grid.querySelector(`.week-hour[data-hour="${now.hour}"]`)?.classList.add("is-now");
   grid.querySelector(`.week-day[data-day="${now.day}"]`)?.classList.add("is-now");
-  if (!grid.classList.contains("is-recording")) return;
+  if (!grid.classList.contains("is-recording") || !liveBothSockets) return;
   const slot = grid.querySelector(`.week-slot[data-day="${now.day}"][data-hour="${now.hour}"]`);
   if (!slot) return;
   const chips = slot.querySelectorAll(".week-slot-win");
@@ -112,6 +113,7 @@ function paintCoverage(payload) {
       });
     }
   }
+  liveBothSockets = payload.liveBothSockets === true;
   if (typeof payload.recordingEnabled === "boolean") {
     setSwitch(payload.recordingEnabled);
   }
@@ -193,7 +195,7 @@ void (async () => {
   }
   setInterval(() => {
     void loadCoverage().catch(() => {});
-  }, 10_000);
+  }, 5_000);
   setInterval(() => {
     void loadMarkets().catch(() => {});
   }, 30_000);

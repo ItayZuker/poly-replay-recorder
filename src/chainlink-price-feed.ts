@@ -562,6 +562,15 @@ export class ChainlinkPriceFeed {
     );
   }
 
+  /** Resume the RTDS socket after a drop or stall. Does not invent prices. */
+  resumeSocket(): void {
+    if (!this.started) {
+      this.start();
+      return;
+    }
+    this.forceReconnect();
+  }
+
   /** Close and reschedule the RTDS socket (health watchdog / manual recovery). */
   forceReconnect(): void {
     if (this.tearingDown) return;
@@ -687,7 +696,9 @@ export class ChainlinkPriceFeed {
     this.tickHistory.set(asset, ticks);
 
     this.tryCaptureFromTick(asset, ts, parsedValue);
-    this.notifyUpdate(asset, ts);
+    if (!options?.restFallback) {
+      this.notifyUpdate(asset, ts);
+    }
   }
 
   onUpdate(listener: (asset: string, timestampMs: number) => void): () => void {

@@ -36,7 +36,13 @@ export interface RecordedWindowDocument {
   conditionId?: string;
   assetPrice?: number;
   prevCloseAsset?: number;
-  /** Append-only PTB changes: first Chainlink, REST openPrice, Gamma at windowEnd. */
+  /** First raw Chainlink print at/near window open. */
+  ptbChainlink?: number;
+  /** Official RTDS 30s TWAP at/near window open. */
+  ptbTwap30?: number;
+  /** Official RTDS 60s TWAP at/near window open. */
+  ptbTwap60?: number;
+  /** Append-only PTB changes: first Chainlink, then Gamma at windowEnd. */
   ptbHistory?: PtbHistoryEntry[];
   /** Official Gamma eventMetadata.priceToBeat (separate from REST history). */
   gammaPtb?: number;
@@ -147,6 +153,9 @@ export interface WindowHitRecord {
   conditionId?: string;
   assetPrice?: number;
   prevCloseAsset?: number;
+  ptbChainlink?: number;
+  ptbTwap30?: number;
+  ptbTwap60?: number;
   ptbHistory?: PtbHistoryEntry[];
   gammaPtb?: number;
   assetGap?: number;

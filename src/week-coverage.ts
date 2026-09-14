@@ -4,7 +4,12 @@ import {
   selectLatestDayHourWindows,
 } from "./day-hour-slots.js";
 import { getMarket } from "./db/market-repository.js";
-import { listRecordedWindowStarts } from "./db/recorded-window-repository.js";
+import {
+  COVERAGE_FLUSH_GRACE_SEC,
+  listTickWindowStarts,
+  windowsHavingBookAndChainlinkTicks,
+} from "./db/tick-repository.js";
+import { recordingManager } from "./recording-manager.js";
 
 export const WEEK_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
 export type WeekDayId = (typeof WEEK_DAYS)[number];
@@ -24,6 +29,8 @@ export interface WeekCoverage {
   expectedPerHour: number;
   weekStart: number;
   slots: HourSlotCoverage[];
+  /** Current window is receiving both raw CLOB and Chainlink. */
+  liveBothSockets: boolean;
 }
 
 /** Monday 00:00 UTC of the current UTC week, unix seconds. */
@@ -75,10 +82,12 @@ export async function getWeekCoverage(series: string): Promise<WeekCoverage> {
   const nowSec = Math.floor(Date.now() / 1000);
   const cutoff = getWeekHistoryCutoffUtcSec();
 
+  const tickStarts = (await listTickWindowStarts(market._id)).filter(
+    (windowStart) => windowStart >= cutoff,
+  );
+  const complete = await windowsHavingBookAndChainlinkTicks(market, tickStarts);
   const present = new Set(
-    (await listRecordedWindowStarts(market._id)).filter(
-      (windowStart) => windowStart >= cutoff && windowStart + winSec <= nowSec,
-    ),
+    complete.filter((windowStart) => windowStart + winSec + COVERAGE_FLUSH_GRACE_SEC <= nowSec),
   );
   const prior = selectLatestDayHourWindows(
     [...present]
@@ -121,5 +130,6 @@ export async function getWeekCoverage(series: string): Promise<WeekCoverage> {
     expectedPerHour: expected,
     weekStart,
     slots,
+    liveBothSockets: recordingManager.getRecorder(market._id)?.isLiveBothSockets() === true,
   };
 }

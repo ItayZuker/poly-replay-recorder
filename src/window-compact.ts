@@ -200,6 +200,9 @@ export function fromStoredRecordedWindow(doc: StoredWindowDocument): RecordedWin
       chainlinkCount: doc.chainlinkCount as number | undefined,
       ptbHistory: decodePtbHistory(doc.ptbHistory ?? doc[WK.ptbHistory]),
       gammaPtb: (doc.gammaPtb ?? doc[WK.gammaPtb]) as number | undefined,
+      ptbChainlink: doc.ptbChainlink as number | undefined,
+      ptbTwap30: doc.ptbTwap30 as number | undefined,
+      ptbTwap60: doc.ptbTwap60 as number | undefined,
     });
   }
 

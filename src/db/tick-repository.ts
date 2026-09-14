@@ -20,11 +20,49 @@ import {
   toStoredChainlinkTick,
   type StoredTickDocument,
 } from "../tick-compact.js";
+import { isUnusablePricePath } from "../window-dynamics.js";
 import fs from "fs/promises";
 import path from "path";
 
-async function appendTicks<T>(filePath: string, docs: T[]): Promise<void> {
-  await appendJsonlLines(filePath, docs);
+/** Only cache usable=true. A premature false (pre-flush) must be allowed to flip. */
+const usableWindowCache = new Set<string>();
+/** Wait for the last tick flush before scoring a just-ended window. */
+export const COVERAGE_FLUSH_GRACE_SEC = 3;
+
+/** Per-file `_id`s already on disk — skip appends that would duplicate a retry. */
+const writtenTickIdsByFile = new Map<string, Set<string>>();
+
+async function loadWrittenTickIds(filePath: string): Promise<Set<string>> {
+  const cached = writtenTickIdsByFile.get(filePath);
+  if (cached) return cached;
+  const known = new Set<string>();
+  const rows = await readJsonlFile<{ _id?: unknown }>(filePath);
+  for (const row of rows) {
+    if (row._id != null && String(row._id).length > 0) known.add(String(row._id));
+  }
+  writtenTickIdsByFile.set(filePath, known);
+  return known;
+}
+
+function forgetWrittenTickIds(filePath: string): void {
+  writtenTickIdsByFile.delete(filePath);
+}
+
+async function appendTicks<T extends { _id?: unknown }>(
+  filePath: string,
+  docs: T[],
+): Promise<void> {
+  if (docs.length === 0) return;
+  const known = await loadWrittenTickIds(filePath);
+  const fresh = docs.filter((doc) => {
+    const id = doc._id != null ? String(doc._id) : "";
+    return !id || !known.has(id);
+  });
+  if (fresh.length === 0) return;
+  await appendJsonlLines(filePath, fresh);
+  for (const doc of fresh) {
+    if (doc._id != null && String(doc._id).length > 0) known.add(String(doc._id));
+  }
 }
 
 export async function insertClobRawTicks(
@@ -182,6 +220,7 @@ export async function stampOfficialChainlinkCloseTip(
     ...mid.map((t) => toStoredChainlinkTick(t)),
     toStoredChainlinkTick(tip),
   ]);
+  forgetWrittenTickIds(filePath);
   return "updated";
 }
 
@@ -249,11 +288,33 @@ export async function windowsHavingClobBookTicks(
   return present.sort((a, b) => a - b);
 }
 
+async function windowHasUsablePricePath(
+  market: MarketDocument,
+  windowStart: number,
+): Promise<boolean> {
+  const key = `${market._id}:${windowStart}`;
+  if (usableWindowCache.has(key)) return true;
+  const winSec = (market.timeframeMinutes === 15 ? 15 : 5) * 60;
+  const endedAt = windowStart + winSec;
+  if (Date.now() / 1000 < endedAt + COVERAGE_FLUSH_GRACE_SEC) return false;
+  const ticks = await listChainlinkTicks(market, windowStart);
+  const usable = !isUnusablePricePath(
+    ticks.map((tick) => ({
+      tMs: tick.tMs,
+      assetPrice: tick.assetPrice,
+    })),
+    windowStart,
+    endedAt,
+  );
+  if (usable) usableWindowCache.add(key);
+  return usable;
+}
+
 /**
- * Replay-usable windows: non-empty CLOB book **and** Chainlink tick files.
- * Missing either side is treated as no recording for Schedule Replay.
+ * Grid / Replay: non-empty raw CLOB (or legacy book) + Chainlink, and a usable
+ * raw Chainlink path (not empty, not flat, no ≥30s hole).
  */
-export async function windowsHavingReplayTickFiles(
+export async function windowsHavingBookAndChainlinkTicks(
   market: MarketDocument,
   windowStarts: number[],
 ): Promise<number[]> {
@@ -261,14 +322,24 @@ export async function windowsHavingReplayTickFiles(
   await Promise.all(
     windowStarts.map(async (windowStart) => {
       if (!Number.isFinite(windowStart)) return;
-      const [hasBook, hasChainlink] = await Promise.all([
+      const [hasRaw, hasBook, hasChainlink] = await Promise.all([
+        windowHasNonEmptyTickFile(clobRawTicksPath(market._id, windowStart)),
         windowHasNonEmptyTickFile(clobBookTicksPath(market._id, windowStart)),
         windowHasNonEmptyTickFile(chainlinkTicksPath(market._id, windowStart)),
       ]);
-      if (hasBook && hasChainlink) present.push(windowStart);
+      if (!((hasRaw || hasBook) && hasChainlink)) return;
+      if (await windowHasUsablePricePath(market, windowStart)) present.push(windowStart);
     }),
   );
   return present.sort((a, b) => a - b);
+}
+
+/** Replay-usable windows: files present and raw Chainlink path is usable. */
+export async function windowsHavingReplayTickFiles(
+  market: MarketDocument,
+  windowStarts: number[],
+): Promise<number[]> {
+  return windowsHavingBookAndChainlinkTicks(market, windowStarts);
 }
 
 export async function countClobRawTicksForWindow(

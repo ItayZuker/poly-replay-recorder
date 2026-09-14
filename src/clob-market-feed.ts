@@ -127,6 +127,16 @@ export class ClobMarketFeed {
     }
   }
 
+  /** Resume the market WebSocket after a drop or stall. Does not invent book rows. */
+  resumeSocket(): void {
+    if (!this.started) {
+      logService.warn("clob", "Resume on a stopped feed — starting socket");
+      this.start();
+      return;
+    }
+    this.forceReconnect();
+  }
+
   /** Close and reconnect the market WebSocket (health watchdog / manual recovery). */
   forceReconnect(): void {
     if (!this.started) return;

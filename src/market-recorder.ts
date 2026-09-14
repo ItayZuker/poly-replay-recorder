@@ -1,6 +1,5 @@
-import { clobMarketFeed, hasSocketBook } from "./clob-market-feed.js";
+import { clobMarketFeed } from "./clob-market-feed.js";
 import { ASSET_STALL_TIMEOUT_MS, chainlinkPriceFeed } from "./chainlink-price-feed.js";
-import { getPolymarketWindowAssetPricesForPair } from "./asset-price-service.js";
 import {
   fetchOfficialWindowResolution,
   hasOfficialWindowOutcome,
@@ -13,7 +12,6 @@ import {
   roundPolymarketAssetPriceMaybe,
 } from "./polymarket-display-price.js";
 import {
-  buildUpDownSlug,
   fetchCurrentUpDownMarket,
   fetchCurrentUpDownMarketWithRetry,
   fetchMarketPairFromSlug,
@@ -21,8 +19,7 @@ import {
   parseMarketSeries,
   NEXT_WINDOW_PREFETCH_SEC,
 } from "./market-pair.js";
-import { pickDisplayPrice, pickTriggerPrice } from "./quote-price.js";
-import { RECORDING_BOOK_DEPTH, takeLevels } from "./book-depth.js";
+import { pickDisplayPrice } from "./quote-price.js";
 import { makeStoredTickId, roundTo4 } from "./tick-compact.js";
 import {
   createWindowDynamicsTracker,
@@ -32,11 +29,9 @@ import {
   updateWindowDynamics,
   type WindowDynamicsTracker,
 } from "./window-dynamics.js";
-import { discardBadRecording } from "./bad-recording-cleanup.js";
 import { logService } from "./log-service.js";
 import type {
   ChainlinkTickDocument,
-  ClobBookTickDocument,
   ClobRawTickDocument,
   MarketDocument,
   WindowHitRecord,
@@ -44,20 +39,15 @@ import type {
 import {
   ensureWindowTickDir,
   insertChainlinkTicks,
-  insertClobBookTicks,
   insertClobRawTicks,
-  stampOfficialChainlinkCloseTip,
 } from "./db/tick-repository.js";
 import {
   getRecordedWindow,
-  listRecordedWindows,
   saveRecordedWindow,
 } from "./db/recorded-window-repository.js";
 import {
   appendPtbHistory,
-  isRestPtbSource,
   recordingPtbFields,
-  type PtbHistorySource,
 } from "./ptb-history.js";
 import { deleteRecordedWindowSummary } from "./db/recorded-window-mongo-repository.js";
 import { pruneColdMarketData } from "./db/tick-archive.js";
@@ -70,25 +60,22 @@ import path from "path";
 
 const TICK_FLUSH_MS = 1_500;
 const POLL_MS = 500;
-/** No book/chainlink ticks into the active window for this long → health recovery. */
+/** No raw CLOB or Chainlink ticks into the active window for this long → resume both sockets. */
 const RECORDING_SILENCE_MS = 60_000;
-/** No CLOB book ticks for this long (Chainlink may still be flowing) → CLOB reconnect. */
+/** No raw CLOB messages for this long (Chainlink may still be flowing) → resume CLOB socket. */
 const CLOB_SILENCE_MS = 20_000;
 /** No raw Chainlink ticks for this long (CLOB may still be flowing) → RTDS reconnect. */
 const CHAINLINK_SILENCE_MS = ASSET_STALL_TIMEOUT_MS;
 /** Ignore silence right after a window opens (pair/book may still be warming up). */
 const WINDOW_START_GRACE_MS = 20_000;
 /**
- * After windowEnd, hard-poll Gamma in the background this long before leaving
- * windowOutcome unset on the recording (does not block the next window).
- * Light retries continue until Gamma lands (same pattern as live held settle).
+ * After windowEnd, poll Gamma every 30s for this long, then leave
+ * windowOutcome / gammaPtb unset. Does not block the next window.
  */
 const OFFICIAL_RESOLVE_MAX_WAIT_MS = 20 * 60 * 1000;
-const OFFICIAL_RESOLVE_POLL_MS = 2_000;
-const OFFICIAL_RESOLVE_LIGHT_POLL_MS = 30_000;
-const OFFICIAL_RESOLVE_LIGHT_BATCH = 4;
-/** Resume light retries for unset windows this far back on recorder start. */
-const OFFICIAL_RESOLVE_RESUME_SEC = 2 * 24 * 60 * 60;
+const OFFICIAL_RESOLVE_POLL_MS = 30_000;
+/** Official RTDS TWAP may update a bit slower than raw prints. */
+const OPEN_TWAP_MAX_AGE_MS = 90_000;
 
 type StateChangeListener = (series: string) => void;
 
@@ -100,7 +87,10 @@ export class MarketRecorder {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private clobRawUnsub: (() => void) | null = null;
   private chainlinkUnsub: (() => void) | null = null;
+  private chainlinkTwapUnsub: (() => void) | null = null;
   private sampleInFlight = false;
+  /** Serialize window finalize so a late pair-fetch cannot double-roll. */
+  private rollingInFlight: Promise<void> | null = null;
   private windowFetchPending = false;
   private fastRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private finalizedWindowStarts = new Set<number>();
@@ -111,39 +101,30 @@ export class MarketRecorder {
   private activeNoTokenId: string | null = null;
   private dynamicsTracker: WindowDynamicsTracker = createWindowDynamicsTracker();
   private clobRawBuffer: ClobRawTickDocument[] = [];
-  private clobBookBuffer: ClobBookTickDocument[] = [];
   private chainlinkTickBuffer: ChainlinkTickDocument[] = [];
   private clobRawSeq = 0;
-  private clobBookSeq = 0;
   private chainlinkSeq = 0;
   private windowTickCount = 0;
   private clobRawCount = 0;
-  private clobBookCount = 0;
   private chainlinkCount = 0;
   private assetPrices: { assetPrice?: number; prevCloseAsset?: number } = {};
   /** True once Gamma eventMetadata PTB/close were applied — stop following crypto-price open. */
   private gammaSettled = false;
-  /** Current recorded PTB source for this window (chainlink → rest → gamma). */
-  private livePtbSource: PtbHistorySource | undefined;
   private prefetchedNextWindowStart: number | null = null;
   private nextWindowPrefetchInFlight = false;
-  /** Fingerprint of last written CLOB book tick (skip identical consecutive samples). */
-  private lastBookFingerprint: string | null = null;
-  /** Wall-clock time of the last book/chainlink tick appended for the active window. */
+  /** Wall-clock time of the last raw CLOB or Chainlink tick for the active window. */
   private lastUsefulTickAtMs = 0;
-  /** Wall-clock time of the last CLOB book tick appended for the active window. */
+  /** Wall-clock time of the last raw CLOB message for the active window. */
   private lastClobTickAtMs = 0;
   /** Wall-clock time of the last live RTDS tick (not the opening stub). */
   private lastChainlinkTickAtMs = 0;
   private windowBeganAtMs = 0;
   /** True while captureEndPrices/finalizeWindow run — silence is expected (no in-window ticks). */
   private finalizing = false;
+  /** False until Mongo hydrate finishes — do not snap start PTBs from live yet. */
+  private headerReady = false;
   /** In-flight background Gamma polls keyed by windowStart (non-blocking). */
   private pendingOfficialResolves = new Map<number, Promise<void>>();
-  /** Unset windows waiting for Gamma after the 20m hard poll (or found on start). */
-  private unresolvedOfficialWindows = new Map<number, { windowEnd: number; slug: string }>();
-  private officialLightRetryTimer: ReturnType<typeof setInterval> | null = null;
-  private officialLightRetryInFlight = false;
   private startedAtMs = 0;
   private lastSavedAtMs = 0;
   private lastPriceSampleAtMs = 0;
@@ -166,9 +147,8 @@ export class MarketRecorder {
   }
 
   /**
-   * True when an active window has gone too long without book/chainlink ticks.
-   * Used by RecordingManager for broader feed recovery (beyond Chainlink-only stall).
-   * Not used after windowEnd / while finalizing — in-window ticks stop by design then.
+   * True when an active window has gone too long without raw CLOB or Chainlink ticks.
+   * Used by RecordingManager to resume both sockets. Does not invent ticks.
    */
   needsHealthRecovery(nowMs = Date.now()): boolean {
     if (!this.isActiveWindowEligibleForHealth(nowMs)) return false;
@@ -178,7 +158,7 @@ export class MarketRecorder {
   }
 
   /**
-   * True when CLOB book ticks have gone silent while the window is still open.
+   * True when raw CLOB messages have gone silent while the window is still open.
    * Chainlink-only flow must not mask a dead market WebSocket.
    */
   needsClobRecovery(nowMs = Date.now()): boolean {
@@ -190,7 +170,7 @@ export class MarketRecorder {
 
   /**
    * True when raw Chainlink has gone silent while the window is still open.
-   * REST fallback ticks must not mask a dead RTDS.
+   * REST prices must not mask a dead RTDS.
    */
   needsChainlinkRecovery(nowMs = Date.now()): boolean {
     if (!this.isActiveWindowEligibleForHealth(nowMs)) return false;
@@ -211,6 +191,17 @@ export class MarketRecorder {
   resubscribeActiveClobTokens(): void {
     if (!this.activeYesTokenId || !this.activeNoTokenId) return;
     clobMarketFeed.ensureSubscribed([this.activeYesTokenId, this.activeNoTokenId]);
+  }
+
+  /** Resume the CLOB market socket and re-subscribe this window's tokens. */
+  resumeClobSocket(): void {
+    clobMarketFeed.resumeSocket();
+    this.resubscribeActiveClobTokens();
+  }
+
+  /** Resume the Chainlink RTDS socket. */
+  resumeChainlinkSocket(): void {
+    chainlinkPriceFeed.resumeSocket();
   }
 
   private isActiveWindowEligibleForHealth(nowMs: number): boolean {
@@ -235,6 +226,18 @@ export class MarketRecorder {
 
   getActiveWindow(): WindowHitRecord | null {
     return this.activeWindow ? { ...this.activeWindow } : null;
+  }
+
+  /** True when this window has received both raw CLOB and Chainlink and both sockets are still fresh. */
+  isLiveBothSockets(nowMs = Date.now()): boolean {
+    if (!this.interval || !this.activeWindow || this.finalizing) return false;
+    if (nowMs >= this.activeWindow.windowEnd * 1000) return false;
+    if (this.clobRawCount < 1 || this.chainlinkCount < 1) return false;
+    if (this.lastClobTickAtMs <= 0 || nowMs - this.lastClobTickAtMs >= CLOB_SILENCE_MS) {
+      return false;
+    }
+    const { asset } = parseMarketSeries(this.market._id);
+    return chainlinkPriceFeed.isRawFresh(asset, CHAINLINK_SILENCE_MS);
   }
 
   isRunning(): boolean {
@@ -269,12 +272,9 @@ export class MarketRecorder {
       if (updatedAsset !== asset) return;
       this.recordChainlinkTick();
     });
-
-    void this.enqueueUnsetOfficialFromDisk().catch((err) => {
-      logService.warn(
-        "recorder",
-        `Gamma light-retry resume failed (${this.market._id}): ${String(err)}`,
-      );
+    this.chainlinkTwapUnsub = chainlinkPriceFeed.onTwapUpdate((updatedAsset) => {
+      if (updatedAsset !== asset) return;
+      this.latchOpenPtbs();
     });
 
     logService.success("recorder", `Recording started for ${this.market._id}`);
@@ -293,8 +293,6 @@ export class MarketRecorder {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
-    this.stopOfficialLightRetryTimer();
-    this.unresolvedOfficialWindows.clear();
     if (this.clobRawUnsub) {
       this.clobRawUnsub();
       this.clobRawUnsub = null;
@@ -302,6 +300,10 @@ export class MarketRecorder {
     if (this.chainlinkUnsub) {
       this.chainlinkUnsub();
       this.chainlinkUnsub = null;
+    }
+    if (this.chainlinkTwapUnsub) {
+      this.chainlinkTwapUnsub();
+      this.chainlinkTwapUnsub = null;
     }
     void this.flushTicks();
     this.resetActiveWindow();
@@ -323,7 +325,6 @@ export class MarketRecorder {
     void deleteRecordedWindowSummary(this.market._id, windowStart).catch(() => undefined);
 
     this.clobRawBuffer = [];
-    this.clobBookBuffer = [];
     this.chainlinkTickBuffer = [];
     this.resetActiveWindow();
     void this.purgeWindowArtifacts(windowStart);
@@ -358,27 +359,22 @@ export class MarketRecorder {
     this.activeNoTokenId = null;
     this.dynamicsTracker = createWindowDynamicsTracker();
     this.clobRawBuffer = [];
-    this.clobBookBuffer = [];
     this.chainlinkTickBuffer = [];
     this.clobRawSeq = 0;
-    this.clobBookSeq = 0;
     this.chainlinkSeq = 0;
     this.windowTickCount = 0;
     this.clobRawCount = 0;
-    this.clobBookCount = 0;
     this.chainlinkCount = 0;
-    this.lastBookFingerprint = null;
     this.assetPrices = {};
     this.gammaSettled = false;
-    this.livePtbSource = undefined;
     this.prefetchedNextWindowStart = null;
     this.nextWindowPrefetchInFlight = false;
-    this.lastBookFingerprint = null;
     this.lastUsefulTickAtMs = 0;
     this.lastClobTickAtMs = 0;
     this.lastChainlinkTickAtMs = 0;
     this.windowBeganAtMs = 0;
     this.finalizing = false;
+    this.headerReady = false;
     this.resetPricePathTracker();
   }
 
@@ -447,90 +443,9 @@ export class MarketRecorder {
     return makeStoredTickId(windowStart, this.clobRawSeq).replace(":", ":raw:");
   }
 
-  private nextClobBookId(windowStart: number): string {
-    this.clobBookSeq += 1;
-    return makeStoredTickId(windowStart, this.clobBookSeq).replace(":", ":book:");
-  }
-
   private nextChainlinkId(windowStart: number): string {
     this.chainlinkSeq += 1;
     return makeStoredTickId(windowStart, this.chainlinkSeq).replace(":", ":cl:");
-  }
-
-  private buildClobBookTick(tMs: number): ClobBookTickDocument | null {
-    if (!this.activeWindow || !this.activeYesTokenId || !this.activeNoTokenId) return null;
-    if (!this.isInWindow(tMs)) return null;
-
-    const yesInfo = clobMarketFeed.getCachedMarketInfo(this.activeYesTokenId);
-    const noInfo = clobMarketFeed.getCachedMarketInfo(this.activeNoTokenId);
-    const elapsed = Math.max(0, Math.floor(tMs / 1000 - this.activeWindow.windowStart));
-
-    const tick: ClobBookTickDocument = {
-      _id: this.nextClobBookId(this.activeWindow.windowStart),
-      windowStart: this.activeWindow.windowStart,
-      windowEnd: this.activeWindow.windowEnd,
-      tMs,
-      yesBids: takeLevels(yesInfo?.bids, RECORDING_BOOK_DEPTH),
-      yesAsks: takeLevels(yesInfo?.asks, RECORDING_BOOK_DEPTH),
-      noBids: takeLevels(noInfo?.bids, RECORDING_BOOK_DEPTH),
-      noAsks: takeLevels(noInfo?.asks, RECORDING_BOOK_DEPTH),
-    };
-
-    if (yesInfo) {
-      const yesTrigger = pickTriggerPrice(yesInfo, elapsed);
-      if (yesTrigger.price != null) tick.yesPrice = roundTo4(yesTrigger.price);
-    }
-    if (noInfo) {
-      const noTrigger = pickTriggerPrice(noInfo, elapsed);
-      if (noTrigger.price != null) tick.noPrice = roundTo4(noTrigger.price);
-    }
-
-    return tick;
-  }
-
-  private bookTickFingerprint(tick: ClobBookTickDocument): string {
-    const side = (levels: { price: number; size: number }[] | undefined) =>
-      (levels || []).map((l) => `${l.price}:${l.size}`).join(",");
-    return [
-      side(tick.yesBids),
-      side(tick.yesAsks),
-      side(tick.noBids),
-      side(tick.noAsks),
-    ].join("|");
-  }
-
-  private bookTickHasLevels(tick: ClobBookTickDocument): boolean {
-    return (
-      (tick.yesBids?.length ?? 0) > 0 ||
-      (tick.yesAsks?.length ?? 0) > 0 ||
-      (tick.noBids?.length ?? 0) > 0 ||
-      (tick.noAsks?.length ?? 0) > 0
-    );
-  }
-
-  /**
-   * Append a CLOB book snapshot. Skips empty books and identical consecutive
-   * books unless `force` (window open / close).
-   */
-  private appendClobBookTick(tMs: number, opts: { force?: boolean } = {}): void {
-    const tick = this.buildClobBookTick(tMs);
-    if (!tick) return;
-    const hasLevels = this.bookTickHasLevels(tick);
-    if (!hasLevels && !opts.force) return;
-    const fp = this.bookTickFingerprint(tick);
-    if (!opts.force && fp === this.lastBookFingerprint) return;
-    this.lastBookFingerprint = fp;
-    this.clobBookBuffer.push(tick);
-    this.clobBookCount += 1;
-    this.noteClobTick(tMs);
-    this.onStateChange?.(this.market._id);
-  }
-
-  /** Poll-path book sample so quiet WS periods still advance the recording. */
-  private recordPolledBookTick(tMs: number = Date.now()): void {
-    if (!this.activeWindow || !this.activeYesTokenId || !this.activeNoTokenId) return;
-    if (!this.isInWindow(tMs)) return;
-    this.appendClobBookTick(tMs);
   }
 
   private recordClobRawMessage(event: {
@@ -554,7 +469,8 @@ export class MarketRecorder {
       payload: event.payload,
     });
     this.clobRawCount += 1;
-    this.appendClobBookTick(event.tMs);
+    this.noteClobTick(event.tMs);
+    this.onStateChange?.(this.market._id);
   }
 
   private buildChainlinkTick(tMs: number): ChainlinkTickDocument | null {
@@ -582,11 +498,7 @@ export class MarketRecorder {
     }
     if (this.assetPrices.prevCloseAsset != null) {
       tick.prevCloseAsset = roundTo4(this.assetPrices.prevCloseAsset);
-      tick.priceToBeatSource = this.gammaSettled
-        ? "gamma"
-        : this.livePtbSource === "chainlink"
-          ? "chainlink"
-          : "rest";
+      tick.priceToBeatSource = this.gammaSettled ? "gamma" : "chainlink";
     }
 
     return tick;
@@ -605,19 +517,22 @@ export class MarketRecorder {
   }
 
   private recordChainlinkTick(): void {
+    if (!this.activeWindow) return;
     const { asset } = parseMarketSeries(this.market._id);
+    if (!chainlinkPriceFeed.isRawFresh(asset, CHAINLINK_SILENCE_MS)) return;
     const live = chainlinkPriceFeed.getLivePrice(asset, {
       maxAgeMs: CHAINLINK_SILENCE_MS,
     });
-    if (!live || !this.activeWindow || this.gammaSettled) return;
+    if (!live) return;
 
     this.applyAssetPrice(live.value);
     const tMs = live.timestampMs || Date.now();
     this.lastChainlinkTickAtMs = Date.now();
     this.pushChainlinkTick(tMs);
+    this.latchOpenPtbs();
   }
 
-  /** Update live asset price; first in-window Chainlink tick becomes provisional PTB. */
+  /** Update live asset price. Start PTBs latch only via latchOpenPtbs (not Gamma close). */
   private applyAssetPrice(assetPrice?: number): void {
     if (!this.activeWindow) return;
 
@@ -625,7 +540,6 @@ export class MarketRecorder {
     if (current != null) {
       this.activeWindow.assetPrice = current;
       this.assetPrices.assetPrice = current;
-      this.tryApplyChainlinkOpen(current);
     }
     this.activeWindow.assetGap = assetGapOrUnset(
       this.activeWindow.assetPrice,
@@ -640,16 +554,15 @@ export class MarketRecorder {
     );
   }
 
-  /** First Chainlink print of this window — does not overwrite REST or Gamma. */
+  /** Latch first Chainlink print once; does not overwrite TWAP or Gamma. */
   private tryApplyChainlinkOpen(openPrice?: number): boolean {
-    if (!this.activeWindow || this.gammaSettled) return false;
-    if (isRestPtbSource(this.livePtbSource) || this.livePtbSource === "gamma") return false;
-    if (this.activeWindow.prevCloseAsset != null) return false;
+    if (!this.activeWindow) return false;
+    if (this.activeWindow.ptbChainlink != null) return false;
     const ptb = roundPolymarketAssetPriceMaybe(openPrice);
     if (ptb == null) return false;
+    this.activeWindow.ptbChainlink = ptb;
     this.activeWindow.prevCloseAsset = ptb;
     this.assetPrices.prevCloseAsset = ptb;
-    this.livePtbSource = "chainlink";
     const tSec = this.lastUsefulTickAtMs
       ? this.lastUsefulTickAtMs / 1000
       : Date.now() / 1000;
@@ -658,63 +571,63 @@ export class MarketRecorder {
       ptb,
       source: "chainlink",
     });
-    void this.persistWindowOpenPtb(ptb);
     logService.info("recorder", `Chainlink PTB for ${this.market._id} @ ${ptb}`);
     return true;
   }
 
-  /**
-   * Follow Polymarket crypto-price openPrice until they freeze it (or Gamma settles).
-   * Persists when the published open actually changes (including Chainlink → REST).
-   */
-  private tryApplyPublishedOpen(openPrice?: number): boolean {
-    if (!this.activeWindow || this.gammaSettled) return false;
-    const ptb = roundPolymarketAssetPriceMaybe(openPrice);
-    if (ptb == null) return false;
-    const last = this.activeWindow.ptbHistory?.[this.activeWindow.ptbHistory.length - 1];
-    if (last?.ptb === ptb && last.source === "rest") return false;
+  /** Snap official 30s/60s TWAP and first Chainlink once each; persist if anything new. */
+  private latchOpenPtbs(): void {
+    if (!this.activeWindow || !this.headerReady) return;
+    const { asset } = parseMarketSeries(this.market._id);
+    let changed = false;
 
-    const firstRest = !isRestPtbSource(this.livePtbSource);
-    this.activeWindow.prevCloseAsset = ptb;
-    this.assetPrices.prevCloseAsset = ptb;
-    this.livePtbSource = "rest";
-    const tSec = this.lastUsefulTickAtMs
-      ? this.lastUsefulTickAtMs / 1000
-      : Date.now() / 1000;
-    this.activeWindow.ptbHistory = appendPtbHistory(this.activeWindow.ptbHistory, {
-      t: tSec,
-      ptb,
-      source: "rest",
-    });
-    this.applyAssetPrice(this.assetPrices.assetPrice);
-    void this.persistWindowOpenPtb(ptb);
-    logService.info(
-      "recorder",
-      `${firstRest ? "Published PTB" : "Published PTB updated"} for ${this.market._id} @ ${ptb}`,
-    );
-    return true;
+    if (this.activeWindow.ptbTwap30 == null) {
+      const twap30 = chainlinkPriceFeed.getLiveTwap(asset, 30, {
+        maxAgeMs: OPEN_TWAP_MAX_AGE_MS,
+      });
+      const value = roundPolymarketAssetPriceMaybe(twap30?.value);
+      if (value != null) {
+        this.activeWindow.ptbTwap30 = value;
+        changed = true;
+        logService.info("recorder", `30s TWAP PTB for ${this.market._id} @ ${value}`);
+      }
+    }
+    if (this.activeWindow.ptbTwap60 == null) {
+      const twap60 = chainlinkPriceFeed.getLiveTwap(asset, 60, {
+        maxAgeMs: OPEN_TWAP_MAX_AGE_MS,
+      });
+      const value = roundPolymarketAssetPriceMaybe(twap60?.value);
+      if (value != null) {
+        this.activeWindow.ptbTwap60 = value;
+        changed = true;
+        logService.info("recorder", `60s TWAP PTB for ${this.market._id} @ ${value}`);
+      }
+    }
+    if (this.activeWindow.ptbChainlink == null && chainlinkPriceFeed.isRawFresh(asset)) {
+      const live = chainlinkPriceFeed.getLivePrice(asset, {
+        maxAgeMs: CHAINLINK_SILENCE_MS,
+      });
+      if (this.tryApplyChainlinkOpen(live?.value)) changed = true;
+    }
+
+    if (changed) void this.persistActiveWindowHeader();
   }
 
-  /** Gamma settle replaces PTB/Current with eventMetadata.priceToBeat / finalPrice. */
+  /** Gamma settle writes gammaPtb only — does not overwrite start PTBs. */
   private applyGammaPtb(priceToBeat?: number): void {
     if (!this.activeWindow) return;
     const ptb = roundPolymarketAssetPriceMaybe(priceToBeat);
     if (ptb == null) return;
     this.gammaSettled = true;
-    this.livePtbSource = "gamma";
     this.activeWindow.gammaPtb = ptb;
-    this.activeWindow.prevCloseAsset = ptb;
-    this.assetPrices.prevCloseAsset = ptb;
     this.activeWindow.ptbHistory = appendPtbHistory(this.activeWindow.ptbHistory, {
       t: this.activeWindow.windowEnd,
       ptb,
       source: "gamma",
     });
-    this.applyAssetPrice(this.assetPrices.assetPrice ?? this.activeWindow.assetPrice);
   }
 
-  /** Upsert window summary with published open PTB (may run before finalize). */
-  private async persistWindowOpenPtb(ptb: number): Promise<void> {
+  private async persistActiveWindowHeader(): Promise<void> {
     if (!this.activeWindow) return;
     const win = this.activeWindow;
     const savedAt = new Date().toISOString();
@@ -725,7 +638,7 @@ export class MarketRecorder {
       slug: win.slug,
       question: win.question,
       conditionId: win.conditionId,
-      prevCloseAsset: ptb,
+      prevCloseAsset: win.ptbChainlink ?? win.prevCloseAsset,
       ...recordingPtbFields(win),
       assetPrice: win.assetPrice,
       assetGap: win.assetGap,
@@ -738,9 +651,9 @@ export class MarketRecorder {
       assetRange: win.assetRange,
       rangeTop: win.rangeTop,
       rangeBottom: win.rangeBottom,
-      tickCount: this.clobRawCount + this.clobBookCount + this.chainlinkCount,
+      tickCount: this.clobRawCount + this.chainlinkCount,
       clobRawCount: this.clobRawCount,
-      clobBookCount: this.clobBookCount,
+      clobBookCount: 0,
       chainlinkCount: this.chainlinkCount,
     };
     try {
@@ -748,63 +661,57 @@ export class MarketRecorder {
     } catch (err) {
       logService.warn(
         "recorder",
-        `Failed to persist open PTB for ${this.market._id}: ${String(err)}`,
+        `Failed to persist window header for ${this.market._id}: ${String(err)}`,
       );
     }
   }
 
-  /** Create Mongo stub at window open with PTB unset. */
+  /** Create Mongo stub at window open and latch any PTBs already on RTDS. */
   private async persistWindowStub(): Promise<void> {
-    if (!this.activeWindow) return;
-    const win = this.activeWindow;
-    const savedAt = new Date().toISOString();
-    const doc = {
-      windowStart: win.windowStart,
-      windowEnd: win.windowEnd,
-      savedAt,
-      slug: win.slug,
-      question: win.question,
-      conditionId: win.conditionId,
-      tickCount: 0,
-      clobRawCount: 0,
-      clobBookCount: 0,
-      chainlinkCount: 0,
-    };
-    try {
-      await saveRecordedWindow(this.market, doc);
-    } catch (err) {
-      logService.warn(
-        "recorder",
-        `Failed to persist window stub for ${this.market._id}: ${String(err)}`,
-      );
-    }
+    this.latchOpenPtbs();
+    await this.persistActiveWindowHeader();
   }
 
   private async flushTicks(): Promise<void> {
     const rawBatch = this.clobRawBuffer.splice(0, this.clobRawBuffer.length);
-    const bookBatch = this.clobBookBuffer.splice(0, this.clobBookBuffer.length);
     const chainlinkBatch = this.chainlinkTickBuffer.splice(0, this.chainlinkTickBuffer.length);
-    if (rawBatch.length === 0 && bookBatch.length === 0 && chainlinkBatch.length === 0) return;
+    if (rawBatch.length === 0 && chainlinkBatch.length === 0) return;
 
-    try {
-      await Promise.all([
-        insertClobRawTicks(this.market, rawBatch),
-        insertClobBookTicks(this.market, bookBatch),
-        insertChainlinkTicks(this.market, chainlinkBatch),
-      ]);
-    } catch (err) {
-      logService.error("recorder", `Tick flush failed (${this.market._id}): ${String(err)}`);
+    const [rawResult, chainlinkResult] = await Promise.allSettled([
+      rawBatch.length > 0 ? insertClobRawTicks(this.market, rawBatch) : Promise.resolve(),
+      chainlinkBatch.length > 0
+        ? insertChainlinkTicks(this.market, chainlinkBatch)
+        : Promise.resolve(),
+    ]);
+    if (rawResult.status === "rejected") {
+      logService.error(
+        "recorder",
+        `CLOB tick flush failed (${this.market._id}): ${String(rawResult.reason)}`,
+      );
       this.clobRawBuffer.unshift(...rawBatch);
-      this.clobBookBuffer.unshift(...bookBatch);
+    }
+    if (chainlinkResult.status === "rejected") {
+      logService.error(
+        "recorder",
+        `Chainlink tick flush failed (${this.market._id}): ${String(chainlinkResult.reason)}`,
+      );
       this.chainlinkTickBuffer.unshift(...chainlinkBatch);
     }
   }
 
-  private beginWindow(
+  private async beginWindow(
     windowStart: number,
     windowEnd: number,
-    meta: { slug?: string; question?: string; conditionId?: string },
-  ): void {
+    meta: {
+      slug?: string;
+      question?: string;
+      conditionId?: string;
+      yesTokenId?: string;
+      noTokenId?: string;
+    },
+  ): Promise<void> {
+    if (this.activeWindow?.windowStart === windowStart) return;
+    if (this.activeWindow) return;
     this.activeWindow = {
       windowStart,
       windowEnd,
@@ -814,35 +721,76 @@ export class MarketRecorder {
     };
     this.dynamicsTracker = createWindowDynamicsTracker();
     this.clobRawSeq = 0;
-    this.clobBookSeq = 0;
     this.chainlinkSeq = 0;
     this.windowTickCount = 0;
     this.clobRawCount = 0;
-    this.clobBookCount = 0;
     this.chainlinkCount = 0;
     this.clobRawBuffer = [];
-    this.clobBookBuffer = [];
     this.chainlinkTickBuffer = [];
-    this.lastBookFingerprint = null;
     this.assetPrices = {};
     this.gammaSettled = false;
-    this.livePtbSource = undefined;
+    this.headerReady = false;
     const now = Date.now();
     this.windowBeganAtMs = now;
     this.lastUsefulTickAtMs = now;
     this.lastClobTickAtMs = now;
     this.lastChainlinkTickAtMs = 0;
     this.resetPricePathTracker();
+    if (meta.yesTokenId && meta.noTokenId) {
+      this.subscribeWindowTokens(meta.yesTokenId, meta.noTokenId);
+    }
+    await this.hydrateActiveWindowFromMongo(windowStart);
+    this.headerReady = true;
     const { asset } = parseMarketSeries(this.market._id);
-    const live = chainlinkPriceFeed.getLivePrice(asset, {
-      maxAgeMs: CHAINLINK_SILENCE_MS,
-    });
-    if (live) this.applyAssetPrice(live.value);
+    if (chainlinkPriceFeed.isRawFresh(asset, CHAINLINK_SILENCE_MS)) {
+      const live = chainlinkPriceFeed.getLivePrice(asset, {
+        maxAgeMs: CHAINLINK_SILENCE_MS,
+      });
+      if (live) this.applyAssetPrice(live.value);
+    }
     void ensureWindowTickDir(this.market._id, windowStart);
-    void this.persistWindowStub();
+    await this.persistWindowStub();
     logService.info(
       "recorder",
       `Window started ${new Date(windowStart * 1000).toLocaleTimeString()} for ${this.market._id}`,
+    );
+  }
+
+  /** Resume an in-progress Mongo stub without re-latching start PTBs from live. */
+  private async hydrateActiveWindowFromMongo(windowStart: number): Promise<void> {
+    if (!this.activeWindow || this.activeWindow.windowStart !== windowStart) return;
+    const existing = await getRecordedWindow(this.market, windowStart);
+    if (!existing) return;
+    const win = this.activeWindow;
+    if (existing.slug) win.slug = existing.slug;
+    if (existing.question) win.question = existing.question;
+    if (existing.conditionId) win.conditionId = existing.conditionId;
+    if (existing.ptbChainlink != null) win.ptbChainlink = existing.ptbChainlink;
+    if (existing.ptbTwap30 != null) win.ptbTwap30 = existing.ptbTwap30;
+    if (existing.ptbTwap60 != null) win.ptbTwap60 = existing.ptbTwap60;
+    if (existing.gammaPtb != null) {
+      win.gammaPtb = existing.gammaPtb;
+      this.gammaSettled = true;
+    }
+    if (existing.ptbHistory?.length) win.ptbHistory = existing.ptbHistory;
+    const prev = existing.ptbChainlink ?? existing.prevCloseAsset;
+    if (prev != null) {
+      win.prevCloseAsset = prev;
+      this.assetPrices.prevCloseAsset = prev;
+    }
+    if (existing.minAssetPrice != null) win.minAssetPrice = existing.minAssetPrice;
+    if (existing.maxAssetPrice != null) win.maxAssetPrice = existing.maxAssetPrice;
+    if (existing.assetRange != null) win.assetRange = existing.assetRange;
+    if (existing.ptbCrossings != null) win.ptbCrossings = existing.ptbCrossings;
+    if (existing.yesPrice != null) win.yesPrice = existing.yesPrice;
+    if (existing.noPrice != null) win.noPrice = existing.noPrice;
+    this.clobRawCount = existing.clobRawCount ?? 0;
+    this.chainlinkCount = existing.chainlinkCount ?? 0;
+    this.clobRawSeq = this.clobRawCount;
+    this.chainlinkSeq = this.chainlinkCount;
+    logService.info(
+      "recorder",
+      `Resumed window header ${new Date(windowStart * 1000).toLocaleTimeString()} for ${this.market._id}`,
     );
   }
 
@@ -854,7 +802,6 @@ export class MarketRecorder {
     // Gamma often lands minutes after windowEnd — do not block the next window;
     // a one-shot check here, then background poll up to 20 minutes after end.
     try {
-      const { asset, timeframe } = parseMarketSeries(this.market._id);
       const pair = await fetchMarketPairFromSlug(this.activeWindow.slug);
       const yesInfo = clobMarketFeed.getCachedMarketInfo(pair.yesTokenId);
       const noInfo = clobMarketFeed.getCachedMarketInfo(pair.noTokenId);
@@ -865,17 +812,12 @@ export class MarketRecorder {
       if (official) {
         this.applyAssetPrice(official.finalPrice);
         this.applyGammaPtb(official.priceToBeat);
-        this.gammaSettled = true;
         this.activeWindow.windowOutcome = official.outcome;
         if (official.yesPrice != null) this.activeWindow.yesPrice = official.yesPrice;
         if (official.noPrice != null) this.activeWindow.noPrice = official.noPrice;
         return;
       }
 
-      // Follow published open if available; never invent PTB. Leave outcome unset for Gamma.
-      const prices = await getPolymarketWindowAssetPricesForPair(asset, timeframe, pair);
-      this.applyAssetPrice(prices.assetPrice);
-      this.tryApplyPublishedOpen(prices.prevCloseAsset);
       logService.info(
         "recorder",
         `Gamma not ready for ${this.activeWindow.slug}; saving without windowOutcome (background poll ≤20m)`,
@@ -885,7 +827,7 @@ export class MarketRecorder {
     }
   }
 
-  /** Non-blocking: poll Gamma until windowEnd+20m, then light-retry until it lands. */
+  /** Non-blocking: poll Gamma every 30s until windowEnd+20m, then leave unset. */
   private scheduleBackgroundOfficialResolve(input: {
     windowStart: number;
     windowEnd: number;
@@ -899,95 +841,6 @@ export class MarketRecorder {
     this.pendingOfficialResolves.set(input.windowStart, work);
   }
 
-  private enqueueOfficialLightRetry(input: {
-    windowStart: number;
-    windowEnd: number;
-    slug: string;
-  }): void {
-    const slug = input.slug.trim();
-    if (!slug) return;
-    this.unresolvedOfficialWindows.set(input.windowStart, {
-      windowEnd: input.windowEnd,
-      slug,
-    });
-    this.ensureOfficialLightRetryTimer();
-  }
-
-  private ensureOfficialLightRetryTimer(): void {
-    if (this.officialLightRetryTimer || !this.interval) return;
-    this.officialLightRetryTimer = setInterval(() => {
-      void this.runOfficialLightRetries();
-    }, OFFICIAL_RESOLVE_LIGHT_POLL_MS);
-  }
-
-  private stopOfficialLightRetryTimer(): void {
-    if (!this.officialLightRetryTimer) return;
-    clearInterval(this.officialLightRetryTimer);
-    this.officialLightRetryTimer = null;
-  }
-
-  private async enqueueUnsetOfficialFromDisk(): Promise<void> {
-    const cutoff = Math.floor(Date.now() / 1000) - OFFICIAL_RESOLVE_RESUME_SEC;
-    const { asset, timeframe } = parseMarketSeries(this.market._id);
-    const windows = await listRecordedWindows(this.market);
-    let queued = 0;
-    for (const window of windows) {
-      if (window.windowStart < cutoff) continue;
-      if (hasOfficialWindowOutcome(window.windowOutcome)) continue;
-      if (this.activeWindow?.windowStart === window.windowStart) continue;
-      const slug =
-        window.slug?.trim() || buildUpDownSlug(asset, timeframe, window.windowStart);
-      if (!slug) continue;
-      this.unresolvedOfficialWindows.set(window.windowStart, {
-        windowEnd: window.windowEnd,
-        slug,
-      });
-      queued += 1;
-    }
-    if (queued === 0) return;
-    logService.info(
-      "recorder",
-      `Queued ${queued} unset window(s) for Gamma light retry (${this.market._id})`,
-    );
-    this.ensureOfficialLightRetryTimer();
-  }
-
-  private async runOfficialLightRetries(): Promise<void> {
-    if (this.officialLightRetryInFlight) return;
-    if (this.unresolvedOfficialWindows.size === 0) {
-      this.stopOfficialLightRetryTimer();
-      return;
-    }
-    this.officialLightRetryInFlight = true;
-    try {
-      let tried = 0;
-      for (const [windowStart, meta] of this.unresolvedOfficialWindows) {
-        if (tried >= OFFICIAL_RESOLVE_LIGHT_BATCH) break;
-        if (this.pendingOfficialResolves.has(windowStart)) continue;
-        if (this.activeWindow?.windowStart === windowStart) continue;
-        tried += 1;
-        try {
-          const official = await fetchOfficialWindowResolution(meta.slug);
-          if (!official) continue;
-          await this.applyOfficialResolutionToSavedWindow(windowStart, official);
-          this.unresolvedOfficialWindows.delete(windowStart);
-          logService.success(
-            "recorder",
-            `Light Gamma retry settled ${meta.slug} → ${official.outcome}`,
-          );
-        } catch (err) {
-          logService.warn(
-            "recorder",
-            `Light Gamma retry failed for ${meta.slug}: ${String(err)}`,
-          );
-        }
-      }
-      if (this.unresolvedOfficialWindows.size === 0) this.stopOfficialLightRetryTimer();
-    } finally {
-      this.officialLightRetryInFlight = false;
-    }
-  }
-
   private async runBackgroundOfficialResolve(input: {
     windowStart: number;
     windowEnd: number;
@@ -998,15 +851,14 @@ export class MarketRecorder {
     if (remainingMs <= 0) {
       logService.warn(
         "recorder",
-        `Official resolution past 20m for ${input.slug}; switching to light retry`,
+        `Official resolution past 20m for ${input.slug}; leaving Gamma PTB unset`,
       );
-      this.enqueueOfficialLightRetry(input);
       return;
     }
 
     logService.info(
       "recorder",
-      `Background Gamma poll for ${input.slug} (up to ${Math.ceil(remainingMs / 1000)}s)`,
+      `Background Gamma poll for ${input.slug} every 30s (up to ${Math.ceil(remainingMs / 1000)}s)`,
     );
 
     const official = await waitForOfficialWindowResolution(input.slug, {
@@ -1017,15 +869,13 @@ export class MarketRecorder {
     if (!official) {
       logService.warn(
         "recorder",
-        `Official resolution unavailable after 20m for ${input.slug}; switching to light retry`,
+        `Official resolution unavailable after 20m for ${input.slug}; leaving Gamma PTB unset`,
       );
-      this.enqueueOfficialLightRetry(input);
       return;
     }
 
     try {
       await this.applyOfficialResolutionToSavedWindow(input.windowStart, official);
-      this.unresolvedOfficialWindows.delete(input.windowStart);
       logService.success(
         "recorder",
         `Background Gamma settled ${input.slug} → ${official.outcome}`,
@@ -1035,7 +885,6 @@ export class MarketRecorder {
         "recorder",
         `Failed to apply background Gamma for ${input.slug}: ${String(err)}`,
       );
-      this.enqueueOfficialLightRetry(input);
     }
   }
 
@@ -1051,44 +900,26 @@ export class MarketRecorder {
       );
       return;
     }
-    // Always apply Gamma outcome + priceToBeat (may refine a prior live open).
     const nextAsset =
       official.finalPrice != null
         ? roundPolymarketAssetPrice(official.finalPrice)
         : existing.assetPrice;
-    const nextPtb =
+    const gammaPtb =
       official.priceToBeat != null && Number.isFinite(official.priceToBeat)
         ? roundPolymarketAssetPrice(official.priceToBeat)
-        : existing.prevCloseAsset;
-    const nextGap =
-      nextAsset != null && nextPtb != null ? roundTo4(nextAsset - nextPtb) : existing.assetGap;
+        : existing.gammaPtb;
     const alreadySettled =
       hasOfficialWindowOutcome(existing.windowOutcome) &&
       existing.windowOutcome === official.outcome &&
-      existing.prevCloseAsset === nextPtb &&
+      existing.gammaPtb === gammaPtb &&
       existing.assetPrice === nextAsset;
     if (alreadySettled) return;
 
-    if (
-      official.finalPrice != null &&
-      Number.isFinite(official.finalPrice) &&
-      nextPtb != null &&
-      Number.isFinite(nextPtb) &&
-      Number.isFinite(existing.windowEnd)
-    ) {
-      await stampOfficialChainlinkCloseTip(
-        this.market,
-        existing.windowStart,
-        existing.windowEnd,
-        { closePrice: official.finalPrice, priceToBeat: nextPtb },
-      );
-    }
-
     const ptbHistory =
-      nextPtb != null && Number.isFinite(nextPtb)
+      gammaPtb != null && Number.isFinite(gammaPtb)
         ? appendPtbHistory(existing.ptbHistory, {
             t: existing.windowEnd,
-            ptb: nextPtb,
+            ptb: gammaPtb,
             source: "gamma",
           })
         : existing.ptbHistory;
@@ -1101,12 +932,16 @@ export class MarketRecorder {
       question: existing.question,
       conditionId: existing.conditionId,
       assetPrice: nextAsset,
-      prevCloseAsset: nextPtb,
+      prevCloseAsset: existing.prevCloseAsset,
       ...recordingPtbFields({
+        ...existing,
         ptbHistory,
-        gammaPtb: nextPtb ?? existing.gammaPtb,
+        gammaPtb,
       }),
-      assetGap: nextGap,
+      assetGap:
+        nextAsset != null && existing.prevCloseAsset != null
+          ? roundTo4(nextAsset - existing.prevCloseAsset)
+          : existing.assetGap,
       windowOutcome: official.outcome,
       yesPrice: official.yesPrice ?? existing.yesPrice,
       noPrice: official.noPrice ?? existing.noPrice,
@@ -1170,15 +1005,10 @@ export class MarketRecorder {
     try {
       const pair = await fetchUpDownMarketAtWindow(this.market._id, nextStart);
       clobMarketFeed.ensureSubscribed([pair.yesTokenId, pair.noTokenId]);
-      const seeded = await clobMarketFeed.seedBooksFromRest([
-        pair.yesTokenId,
-        pair.noTokenId,
-      ]);
       this.prefetchedNextWindowStart = nextStart;
       logService.info(
         "recorder",
-        `Prefetched next window ${new Date(nextStart * 1000).toLocaleTimeString()} tokens for ${this.market._id}` +
-          (seeded > 0 ? ` (REST book×${seeded})` : ""),
+        `Prefetched next window ${new Date(nextStart * 1000).toLocaleTimeString()} tokens for ${this.market._id}`,
       );
     } catch (err) {
       logService.warn(
@@ -1190,43 +1020,11 @@ export class MarketRecorder {
     }
   }
 
-  /**
-   * Seed REST books then write the opening CLOB + Chainlink ticks at windowStart
-   * so Replay sees Ask/Bid from the first sample (same early book Live Demo uses).
-   */
-  private async writeOpeningSocketTicks(
-    windowStart: number,
-    yesTokenId: string,
-    noTokenId: string,
-  ): Promise<void> {
+  /** Subscribe Yes/No tokens on the CLOB socket. Does not invent an opening book. */
+  private subscribeWindowTokens(yesTokenId: string, noTokenId: string): void {
     this.activeYesTokenId = yesTokenId;
     this.activeNoTokenId = noTokenId;
-    const openMs = windowStart * 1000;
     clobMarketFeed.ensureSubscribed([yesTokenId, noTokenId]);
-    try {
-      const seeded = await clobMarketFeed.seedBooksFromRest([yesTokenId, noTokenId]);
-      if (seeded > 0) {
-        logService.info(
-          "recorder",
-          `REST-seeded opening book for ${this.market._id} (${seeded} side(s))`,
-        );
-      }
-    } catch (err) {
-      logService.warn(
-        "recorder",
-        `Opening REST book seed failed (${this.market._id}): ${String(err)}`,
-      );
-    }
-    const yesInfo = clobMarketFeed.getCachedMarketInfo(yesTokenId);
-    const noInfo = clobMarketFeed.getCachedMarketInfo(noTokenId);
-    // Always force an opening book row when any side has levels (timestamp = window open).
-    if (hasSocketBook(yesInfo) || hasSocketBook(noInfo)) {
-      this.appendClobBookTick(openMs, { force: true });
-    }
-    const { asset } = parseMarketSeries(this.market._id);
-    if (chainlinkPriceFeed.isAssetFresh(asset, CHAINLINK_SILENCE_MS)) {
-      this.pushChainlinkTick(openMs);
-    }
   }
 
   private async pruneOldData(): Promise<void> {
@@ -1247,14 +1045,6 @@ export class MarketRecorder {
 
     this.finalizing = true;
     try {
-      // Last in-window book sample (t < windowEnd) so Replay has a closing Ask/Bid.
-      const lastBookMs = Math.min(Date.now(), this.activeWindow.windowEnd * 1000 - 1);
-      if (lastBookMs >= windowStart * 1000) {
-        this.appendClobBookTick(lastBookMs, { force: true });
-      }
-
-      // Must stay inside try — a throw here used to leave finalizing=true forever
-      // and block health recovery / new windows.
       finalizeWindowDynamics(this.activeWindow);
 
       let record: WindowHitRecord = {
@@ -1281,11 +1071,11 @@ export class MarketRecorder {
 
       await this.flushTicks();
 
-      if (this.clobBookCount === 0 && this.chainlinkCount === 0) {
-        await discardBadRecording(this.market._id, windowStart, "no book or chainlink ticks");
-        this.finalizedWindowStarts.add(windowStart);
-        this.onStateChange?.(this.market._id);
-        return;
+      if (this.clobRawCount === 0 && this.chainlinkCount === 0) {
+        logService.warn(
+          "recorder",
+          `No raw CLOB or Chainlink ticks for ${this.market._id} @ ${new Date(windowStart * 1000).toLocaleTimeString()} — keeping Mongo header`,
+        );
       }
 
       if (isFlatPriceWindow(record) || this.isActiveWindowUnusablePricePath()) {
@@ -1316,31 +1106,12 @@ export class MarketRecorder {
         assetRange: record.assetRange,
         rangeTop: record.rangeTop,
         rangeBottom: record.rangeBottom,
-        tickCount: this.clobRawCount + this.clobBookCount + this.chainlinkCount,
+        tickCount: this.clobRawCount + this.chainlinkCount,
         clobRawCount: this.clobRawCount,
-        clobBookCount: this.clobBookCount,
+        clobBookCount: 0,
         chainlinkCount: this.chainlinkCount,
       };
       await saveRecordedWindow(this.market, recordedDoc);
-
-      // Immediate Gamma settle at finalize: stamp official close tip (same as background path).
-      if (
-        hasOfficialWindowOutcome(recordedDoc.windowOutcome) &&
-        recordedDoc.assetPrice != null &&
-        Number.isFinite(recordedDoc.assetPrice) &&
-        recordedDoc.prevCloseAsset != null &&
-        Number.isFinite(recordedDoc.prevCloseAsset)
-      ) {
-        await stampOfficialChainlinkCloseTip(
-          this.market,
-          recordedDoc.windowStart,
-          recordedDoc.windowEnd,
-          {
-            closePrice: recordedDoc.assetPrice,
-            priceToBeat: recordedDoc.prevCloseAsset,
-          },
-        ).catch(() => {});
-      }
 
       await this.pruneOldData();
 
@@ -1348,7 +1119,7 @@ export class MarketRecorder {
       this.lastSavedAtMs = Date.now();
       logService.success(
         "recorder",
-        `Window saved ${new Date(windowStart * 1000).toLocaleTimeString()} (${this.clobRawCount} raw, ${this.clobBookCount} book, ${this.chainlinkCount} chainlink)`,
+        `Window saved ${new Date(windowStart * 1000).toLocaleTimeString()} (${this.clobRawCount} raw, ${this.chainlinkCount} chainlink)`,
       );
       this.onStateChange?.(this.market._id);
 
@@ -1392,6 +1163,10 @@ export class MarketRecorder {
   }
 
   private async collectSample(): Promise<void> {
+    const rolled = await this.rollIfDue();
+    if (rolled || !this.activeWindow) {
+      await this.openCurrentWindowFromLivePair();
+    }
     if (this.sampleInFlight) return;
     this.sampleInFlight = true;
     try {
@@ -1401,15 +1176,53 @@ export class MarketRecorder {
     }
   }
 
+  /** Finalize a closed window even when a pair fetch is still in flight. */
+  private async rollIfDue(): Promise<boolean> {
+    if (!this.activeWindow || this.finalizing) return false;
+    if (Math.floor(Date.now() / 1000) < this.activeWindow.windowEnd) return false;
+    if (this.rollingInFlight) {
+      await this.rollingInFlight;
+      return true;
+    }
+    const work = this.rollClosedWindow().finally(() => {
+      if (this.rollingInFlight === work) this.rollingInFlight = null;
+    });
+    this.rollingInFlight = work;
+    await work;
+    return true;
+  }
+
+  /** Open the live window after a roll without waiting on a stuck 30s pair retry. */
+  private async openCurrentWindowFromLivePair(): Promise<void> {
+    if (this.activeWindow || this.finalizing) return;
+    try {
+      const pair = await fetchCurrentUpDownMarket(this.market._id);
+      if (this.activeWindow || this.finalizing) return;
+      if (pair.windowStart == null || pair.windowEnd == null) return;
+      if (Math.floor(Date.now() / 1000) >= pair.windowEnd) return;
+      if (
+        this.discardedWindowStarts.has(pair.windowStart) ||
+        this.finalizedWindowStarts.has(pair.windowStart)
+      ) {
+        return;
+      }
+      await this.beginWindow(pair.windowStart, pair.windowEnd, {
+        question: pair.question,
+        slug: pair.slug,
+        conditionId: pair.conditionId,
+        yesTokenId: pair.yesTokenId,
+        noTokenId: pair.noTokenId,
+      });
+    } catch {
+      // runCollectSample / fast-retry still opens the window
+    }
+  }
+
   private async runCollectSample(): Promise<void> {
     const nowSec = Math.floor(Date.now() / 1000);
-    let rolling = false;
-
-    if (this.activeWindow && nowSec >= this.activeWindow.windowEnd) {
-      await this.rollClosedWindow();
-      rolling = true;
-      this.windowFetchPending = true;
-    } else if (this.activeWindow) {
+    const rolling = await this.rollIfDue();
+    if (rolling) this.windowFetchPending = true;
+    else if (this.activeWindow) {
       void this.prefetchNextWindowTokens();
     }
 
@@ -1451,32 +1264,7 @@ export class MarketRecorder {
 
     clobMarketFeed.ensureSubscribed([pair.yesTokenId, pair.noTokenId]);
 
-    const { asset, timeframe } = parseMarketSeries(this.market._id);
-    let assetPrice: number | undefined;
-    let prevCloseAsset: number | undefined;
-    try {
-      if (pair.windowStart != null && pair.eventStartTimeIso && pair.eventEndTimeIso) {
-        const prices = await getPolymarketWindowAssetPricesForPair(asset, timeframe, pair);
-        assetPrice = prices.assetPrice;
-        prevCloseAsset = prices.prevCloseAsset;
-      }
-    } catch {
-      const live = chainlinkPriceFeed.getLivePrice(asset, {
-        maxAgeMs: CHAINLINK_SILENCE_MS,
-      });
-      if (live) assetPrice = live.value;
-    }
-
     if (this.activeWindow && pair.windowStart === this.activeWindow.windowStart) {
-      this.applyAssetPrice(assetPrice);
-      this.tryApplyPublishedOpen(prevCloseAsset);
-      if (
-        assetPrice != null &&
-        Number.isFinite(assetPrice) &&
-        !chainlinkPriceFeed.isRawFresh(asset)
-      ) {
-        chainlinkPriceFeed.ingestFallbackPrice(asset, assetPrice);
-      }
       const yesInfo = clobMarketFeed.getCachedMarketInfo(pair.yesTokenId);
       const noInfo = clobMarketFeed.getCachedMarketInfo(pair.noTokenId);
       if (yesInfo) this.activeWindow.yesPrice = pickDisplayPrice(yesInfo).price;
@@ -1489,7 +1277,7 @@ export class MarketRecorder {
 
       if (this.activeWindow && this.activeWindow.windowStart !== windowStart) {
         if (nowSec >= this.activeWindow.windowEnd) {
-          await this.rollClosedWindow();
+          await this.rollIfDue();
         } else if (this.activeWindow.slug) {
           try {
             pair = await fetchMarketPairFromSlug(this.activeWindow.slug);
@@ -1506,24 +1294,20 @@ export class MarketRecorder {
         ) {
           // Stall-damaged or already finished — wait for the next window.
         } else {
-          this.beginWindow(windowStart, windowEnd, {
+          await this.beginWindow(windowStart, windowEnd, {
             question: pair.question,
             slug: pair.slug,
             conditionId: pair.conditionId,
+            yesTokenId: pair.yesTokenId,
+            noTokenId: pair.noTokenId,
           });
-          this.applyAssetPrice(assetPrice);
-          this.tryApplyPublishedOpen(prevCloseAsset);
-          await this.writeOpeningSocketTicks(windowStart, pair.yesTokenId, pair.noTokenId);
         }
       } else if (this.activeWindow.windowStart === windowStart && pair.conditionId) {
         this.activeWindow.conditionId = pair.conditionId;
       }
 
       if (this.activeWindow && this.activeWindow.windowStart === windowStart) {
-        this.activeYesTokenId = pair.yesTokenId;
-        this.activeNoTokenId = pair.noTokenId;
-        // Poll-sample books so quiet WS gaps still record Ask/Bid changes (first→last).
-        this.recordPolledBookTick(Date.now());
+        this.subscribeWindowTokens(pair.yesTokenId, pair.noTokenId);
       }
     }
 

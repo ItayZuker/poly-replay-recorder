@@ -8,7 +8,7 @@ import { canProcessRecord } from "./recording-enabled.js";
 
 const HEALTH_CHECK_MS = 5_000;
 /** Avoid thrashing reconnects if silence persists across consecutive windows. */
-const RECOVERY_COOLDOWN_MS = 90_000;
+const RECOVERY_COOLDOWN_MS = 15_000;
 /** Recording is on but no window has been saved this long → warn (do not stop). */
 const SAVE_STALL_MS = 10 * 60 * 1000;
 const SAVE_STALL_LOG_EVERY_MS = 60_000;
@@ -26,13 +26,25 @@ export class RecordingManager {
     this.onChange = listener;
   }
 
+  private ensureFeedsStarted(): void {
+    clobMarketFeed.start();
+    chainlinkPriceFeed.start();
+  }
+
+  private stopFeedsIfIdle(): void {
+    if (this.recorders.size > 0) return;
+    clobMarketFeed.stop();
+    chainlinkPriceFeed.stop();
+  }
+
   private ensureStallHandler(): void {
     if (this.stallUnsub) return;
     this.stallUnsub = chainlinkPriceFeed.onAssetStall((asset) => {
       logService.warn(
         "chainlink",
-        `${asset.toUpperCase()} price stalled — reconnecting RTDS (keeping window)`,
+        `${asset.toUpperCase()} price stalled — resuming RTDS socket`,
       );
+      chainlinkPriceFeed.resumeSocket();
     });
   }
 
@@ -45,11 +57,10 @@ export class RecordingManager {
   }
 
   /**
-   * Reconnect dead feeds. Never discard the in-progress window — a blip must
-   * not delete capture. Unusable paths are rejected at finalize instead.
-   * - Full silence: reconnect both feeds (do not restart the recorder).
-   * - Chainlink-only silence: reconnect RTDS.
-   * - CLOB-only silence: reconnect market WS and re-subscribe tokens.
+   * Resume dead sockets. Never invent ticks or discard the in-progress window.
+   * - Full silence: resume both sockets.
+   * - Chainlink-only silence: resume RTDS.
+   * - CLOB-only silence: resume market WS and re-subscribe tokens.
    */
   private async checkRecordingHealth(): Promise<void> {
     if (!canProcessRecord() || this.recorders.size === 0) return;
@@ -88,39 +99,44 @@ export class RecordingManager {
         const labels = fullSilence.map((r) => r.getSeries()).join(", ");
         logService.warn(
           "recorder",
-          `Recording silence on ${labels} — reconnecting feeds (keeping window)`,
+          `Recording silence on ${labels} — resuming CLOB and Chainlink sockets`,
         );
-        chainlinkPriceFeed.forceReconnect();
-        clobMarketFeed.forceReconnect();
-        for (const recorder of fullSilence) {
-          recorder.resubscribeActiveClobTokens();
-        }
+        RecordingManager.resumeChainlinkSocket();
+        RecordingManager.resumeClobSocket(fullSilence);
       }
 
       if (chainlinkSilence.length > 0) {
         const labels = chainlinkSilence.map((r) => r.getSeries()).join(", ");
         logService.warn(
           "recorder",
-          `Chainlink silence on ${labels} — reconnecting RTDS (keeping window)`,
+          `Chainlink silence on ${labels} — resuming RTDS socket`,
         );
-        chainlinkPriceFeed.forceReconnect();
+        RecordingManager.resumeChainlinkSocket();
       }
 
       if (clobSilence.length > 0) {
         const labels = clobSilence.map((r) => r.getSeries()).join(", ");
         logService.warn(
           "recorder",
-          `CLOB silence on ${labels} — reconnecting market WebSocket (keeping window)`,
+          `CLOB silence on ${labels} — resuming market WebSocket`,
         );
-        clobMarketFeed.forceReconnect();
-        for (const recorder of clobSilence) {
-          recorder.resubscribeActiveClobTokens();
-        }
+        RecordingManager.resumeClobSocket(clobSilence);
       }
     } catch (err) {
       logService.error("recorder", `Health recovery failed: ${String(err)}`);
     } finally {
       this.recoveryInFlight = false;
+    }
+  }
+
+  static resumeChainlinkSocket(): void {
+    chainlinkPriceFeed.resumeSocket();
+  }
+
+  static resumeClobSocket(recorders: MarketRecorder[]): void {
+    clobMarketFeed.resumeSocket();
+    for (const recorder of recorders) {
+      recorder.resubscribeActiveClobTokens();
     }
   }
 
@@ -154,6 +170,7 @@ export class RecordingManager {
     const enabled = new Set(
       markets.filter((m) => m.recordingEnabled).map((m) => m._id),
     );
+    if (enabled.size > 0) this.ensureFeedsStarted();
 
     for (const [series, recorder] of this.recorders) {
       if (!enabled.has(series)) {
@@ -171,6 +188,7 @@ export class RecordingManager {
       this.recorders.set(market._id, recorder);
       logService.info("recorder", `Recording started for ${market._id}`);
     }
+    this.stopFeedsIfIdle();
   }
 
   async refreshMarket(market: MarketDocument): Promise<void> {
@@ -187,6 +205,7 @@ export class RecordingManager {
     this.ensureHealthWatchdog();
     const existing = this.recorders.get(market._id);
     if (market.recordingEnabled) {
+      this.ensureFeedsStarted();
       if (existing) {
         existing.stop();
         this.recorders.delete(market._id);
@@ -200,6 +219,7 @@ export class RecordingManager {
       this.recorders.delete(market._id);
       logService.info("recorder", `Recording stopped for ${market._id}`);
     }
+    this.stopFeedsIfIdle();
   }
 
   getRecorder(series: string): MarketRecorder | undefined {
@@ -224,6 +244,8 @@ export class RecordingManager {
       recorder.stop();
     }
     this.recorders.clear();
+    clobMarketFeed.stop();
+    chainlinkPriceFeed.stop();
   }
 }
 
