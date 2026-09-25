@@ -1,5 +1,6 @@
 import { compress, decompress } from "@mongodb-js/zstd";
 import fs from "fs/promises";
+import { slimJsonlDocument, tickKindFromPath } from "../tick-slim.js";
 import {
   chainlinkTicksPath,
   chainlinkTicksZstPath,
@@ -31,7 +32,14 @@ async function jsonlToZst(jsonlPath: string, zstPath: string): Promise<void> {
   if (raw.length === 0) {
     throw new Error(`Empty JSONL: ${jsonlPath}`);
   }
-  const packed = await compress(raw, ZSTD_LEVEL);
+  const kind = tickKindFromPath(jsonlPath);
+  const body = kind
+    ? Buffer.from(slimJsonlDocument(kind, raw.toString("utf8")).text)
+    : raw;
+  if (body.length === 0) {
+    throw new Error(`Empty JSONL after slim: ${jsonlPath}`);
+  }
+  const packed = await compress(body, ZSTD_LEVEL);
   await fs.writeFile(zstPath, packed);
 }
 

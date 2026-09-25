@@ -1,5 +1,6 @@
 import type { BookLevel } from "./clob-service.js";
 import { takeLevels } from "./book-depth.js";
+import { slimChainlinkTick } from "./tick-slim.js";
 import type { BookTickDocument, ChainlinkTickDocument } from "./types.js";
 
 /** Tick kind stored in key `0` (1 = book, 2 = chainlink). */
@@ -179,7 +180,7 @@ function expandChainlinkDerived(tick: ChainlinkTickDocument): ChainlinkTickDocum
 }
 
 export function toStoredChainlinkTick(tick: ChainlinkTickDocument): StoredTickDocument {
-  return { ...tick };
+  return slimChainlinkTick(tick as unknown as Record<string, unknown>);
 }
 
 export function fromStoredChainlinkTick(doc: StoredTickDocument): ChainlinkTickDocument {

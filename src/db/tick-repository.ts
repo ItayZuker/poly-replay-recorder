@@ -24,6 +24,7 @@ import {
   toStoredChainlinkTick,
   type StoredTickDocument,
 } from "../tick-compact.js";
+import { slimClobRawTick, slimChainlinkTick } from "../tick-slim.js";
 import { isUnusablePricePath } from "../window-dynamics.js";
 import fs from "fs/promises";
 import path from "path";
@@ -55,6 +56,7 @@ export function forgetWrittenTickIds(filePath: string): void {
 async function appendTicks<T extends { _id?: unknown }>(
   filePath: string,
   docs: T[],
+  present: (doc: T) => unknown | null = (doc) => doc,
 ): Promise<void> {
   if (docs.length === 0) return;
   const known = await loadWrittenTickIds(filePath);
@@ -63,7 +65,8 @@ async function appendTicks<T extends { _id?: unknown }>(
     return !id || !known.has(id);
   });
   if (fresh.length === 0) return;
-  await appendJsonlLines(filePath, fresh);
+  const stored = fresh.map(present).filter((row) => row != null);
+  if (stored.length > 0) await appendJsonlLines(filePath, stored);
   for (const doc of fresh) {
     if (doc._id != null && String(doc._id).length > 0) known.add(String(doc._id));
   }
@@ -82,7 +85,9 @@ export async function insertClobRawTicks(
   }
   await Promise.all(
     [...byWindow.entries()].map(([windowStart, batch]) =>
-      appendTicks(clobRawTicksPath(market._id, windowStart), batch),
+      appendTicks(clobRawTicksPath(market._id, windowStart), batch, (tick) =>
+        slimClobRawTick(tick as unknown as Record<string, unknown>),
+      ),
     ),
   );
 }
@@ -118,7 +123,9 @@ export async function insertChainlinkTicks(
   }
   await Promise.all(
     [...byWindow.entries()].map(([windowStart, batch]) =>
-      appendTicks(chainlinkTicksPath(market._id, windowStart), batch),
+      appendTicks(chainlinkTicksPath(market._id, windowStart), batch, (tick) =>
+        slimChainlinkTick(tick as unknown as Record<string, unknown>),
+      ),
     ),
   );
 }
